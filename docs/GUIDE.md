@@ -399,13 +399,42 @@ Test Mode roughly doubles Yahoo calls while it runs.
 
 ### 7.3 Backups and quotas
 
-Google Sheets keeps **File → Version history**; also make an occasional copy of the sheet. Apps Script has daily limits on trigger runtime and URL fetch calls; check the current figures on Google's Apps Script quotas page. A normal run with a handful of tickers takes tens of seconds and the hourly trigger exits immediately outside scheduled hours, so personal use should sit far below the limits.
+Google Sheets keeps **File → Version history**; also make an occasional copy of the sheet (section 7.5 explains how to back up and restore everything). Apps Script has daily limits on trigger runtime and URL fetch calls; check the current figures on Google's Apps Script quotas page. A normal run with a handful of tickers takes tens of seconds and the hourly trigger exits immediately outside scheduled hours, so personal use should sit far below the limits.
 
 ### 7.4 Failure alert email (optional)
 
 A daily check at about 23:00 can email you when prices have stopped refreshing. In the Config tab set `alertEmail` to your address, or to the word `me` for the Google account that owns the script; leave it blank for no alerts. `alertAfterHours` (default 26) is how old the last successful refresh may be. The check is skipped at weekends when the Schedule is weekdays-only, at most one email is sent per day, and the Log records it. Run `sendTestAlert` once from the editor to confirm that mail arrives.
 
 Sending email needs one extra permission (`script.send_mail`, already listed in `appsscript.json`), which Google asks for when you re-authorize after upgrading. To drop the feature, delete that scope line and `healthCheck_` in `Features.gs`; nothing else depends on it.
+
+### 7.5 Backing up and restoring everything
+
+What needs protecting is your **data**. It lives only in the Google Sheet (every tab: Owned, Watchlist, Sold, History, Notes, Accounts, cash, Config, Schedule). The **code** (the 14 files) can always be reinstalled from the zip or from the GitHub repository, so keep one of those too. There is no server and no other database.
+
+**Make a backup (once a month, and before any big change).**
+
+1. Open the sheet and choose **File → Make a copy**. Name it with the date, for example `Investment Tracker backup 2026-11-11`.
+2. Leave the copy alone. It holds every tab (the hidden ones too) and the script that belongs to the sheet, but Google does not copy the triggers or the web app, so it does nothing by itself and runs no refresh.
+3. Optional extras: **File → Download → Microsoft Excel (.xlsx)** gives a readable archive of all tabs, and **Import / Export → Export to CSV**, one row per lot, gives a plain list of your holdings (section 4.14).
+
+**Restore, depending on what went wrong.**
+
+**A wrong edit or a deleted row.** In the sheet use **File → Version history → See version history** and restore an earlier version, or copy back just the cells you need.
+
+**The sheet was deleted by mistake.** Open Google Drive, go to Trash and restore it (Drive keeps deleted files for about 30 days). It comes back as it was; in Apps Script, check on the clock icon (Triggers) that the two triggers are still there.
+
+**The sheet is gone or broken: use your backup copy.**
+
+1. Open the backup copy, then **Extensions → Apps Script**. The files are there. If you updated the code after that backup, replace them with the current ones (section 3.8).
+2. Choose `setup` in the function list and click **Run**. It points the script at this copy, recreates the two triggers and leaves your data alone.
+3. Click **Deploy → New deployment → Web app** (Execute as: Me, Who has access: Only myself) and bookmark the new URL. The old URL belongs to the old sheet.
+4. Rename the copy to your usual name if you like.
+
+**You only have an .xlsx file.** Upload it to Google Drive and open it with Google Sheets. That gives a new sheet **without the script**, so install the code as in section 3: paste the files, set your own `"timeZone"`, run `setup` and deploy. The tabs and your data are then in place. Small differences are possible: the checkboxes on the Schedule tab may turn into plain TRUE/FALSE cells (they still work), and the price formulas in the hidden tabs are rewritten at the next refresh.
+
+**You only have the CSV of holdings.** Install the app as new and paste the CSV into the importer (section 4.16). That brings back the Owned positions only, not the Sold history, notes, Watchlist, cash balances, History or settings.
+
+**Try it once.** The restore steps rely on Google's own copy and Trash features. Make a copy now, run `setup` in it, open its web app and check that all your data is there, then delete the copy so that only one live app remains. After that you know the restore works before you need it.
 
 ## 8. Troubleshooting
 
