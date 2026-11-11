@@ -124,7 +124,7 @@ The header shows when prices were last refreshed successfully and the next sched
 
 Tabs load when first opened and stay cached; the reload button (↻) on each tab fetches fresh data. Click a column header to sort, click again to reverse. Your last sort of Owned, Watchlist and Sold is remembered the next time you open the app, on every device; the filters are not, so you always start with the full picture.
 
-**Light or dark.** The page follows your device's setting automatically. The round button to the left of **Refresh Now** changes that for the device and browser you are using: each click moves through **Automatic** (follows the device), **Light** and **Dark**, and a short message names the choice. Its icon shows the current choice: a half-filled circle (Automatic), a sun (Light) or a moon (Dark). The choice is remembered on that device only; your other devices keep their own. On a very narrow phone (under about 350 px) there is no room in the header, so the same switch is the last item of the **More** sheet (section 4.19).
+**Light or dark.** The page follows your device's setting automatically. The round button to the left of **Refresh Now** changes that for the device and browser you are using: each click moves through **Automatic** (follows the device), **Light** and **Dark**, and a short message names the choice. Its icon shows the current choice: a half-filled circle (Automatic), a sun (Light) or a moon (Dark). The choice is remembered on that device only; your other devices keep their own. On a phone the same switch is also the last item of the **More** sheet (section 4.19).
 
 ### 4.2 Owned tab
 
@@ -294,7 +294,7 @@ On the Owned tab the title of this menu also holds a **Stock split...** button, 
 The same web page adapts to a narrow screen (up to 760 px wide, or a phone held sideways), so there is nothing extra to install: open the same URL on the phone. The layout switches by itself when you rotate the phone or resize the window.
 
 - **Tabs.** A bar at the bottom holds Owned, Watchlist, Sold, Accounts and **More**; More opens History, Schedule and Log.
-- **Light or dark.** The button next to Refresh Now (or, on a very narrow phone, the **Theme** row at the bottom of **More**) switches between Automatic, Light and Dark, as described in section 4.1.
+- **Light or dark.** The button next to Refresh Now (and the **Theme** row at the bottom of **More**) switches between Automatic, Light and Dark, as described in section 4.1.
 - **Cards.** Every holding, watchlist row, sale and account is a card. On Owned, tap a card (anywhere except the ticker) to open it: the details, one block per lot with **Sell this lot**, edit and delete, and **Sell...**, **Edit** and **Delete** for the whole position. Tap the ticker itself for the Yahoo, Perplexity and Google links and, on Owned, Stock split...
 - **Search and filters.** The search box is always visible. **Filters** unfolds the account, market, status or year choices and the sort order, and shows how many filters are active. The **...** button holds the rest: Reload, Export, Import, Expand all, Remove all Paused, Archive year and Clear Log.
 - **+ Add.** The round button above the tab bar adds a holding, a watchlist row or an account. It steps aside while you scroll down and returns when you scroll up.
