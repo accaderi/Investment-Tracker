@@ -1,0 +1,5 @@
+Ticker,Name,Quantity,Buy price,Currency,Buy date,Account
+NASDAQ:AAPL,Apple Inc.,5,172.40,USD,2025-03-12,Broker A
+ETR:EUNL,iShares Core MSCI World UCITS ETF,20,78.15,EUR,2025-06-02,Broker A
+LON:VOD,Vodafone Group plc,500,72.00,GBX,2025-05-05,Broker B
+NASDAQ:NVDA,NVIDIA Corporation,,,,,

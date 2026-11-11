@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Investment Tracker</title>
+<script>try { document.documentElement.classList.toggle('phone', window.matchMedia('(max-width: 760px), (max-height: 500px) and (pointer: coarse)').matches); } catch (e) { /* the page script sets it again */ }</script>
+<script>try { var th = localStorage.getItem('theme'); if (th === 'light' || th === 'dark') document.documentElement.setAttribute('data-theme', th); } catch (e) { /* storage may be blocked: the page then follows the device setting */ }</script>
+<?!= include('styles') ?>
+</head>
+<body>
+<header class="hdr">
+  <div class="hdr-l">
+    <h1>Investment Tracker</h1>
+    <div class="hdr-meta"><span id="lastUpdated">Last updated: ...</span> <span class="muted" id="nextRuns"></span></div>
+    <div class="muted small hdr-note">Auto-refreshes at the hours enabled in Schedule</div>
+  </div>
+  <div class="hdr-r">
+    <button class="btn icon" id="btnTheme" type="button" title="Theme" aria-label="Theme"></button>
+  <button class="btn primary" id="btnRefresh"><span class="spin hidden" id="refreshSpin"></span><span id="refreshTxt">Refresh Now</span></button>
+  </div>
+</header>
+<nav class="tabs" id="tabs">
+  <button data-tab="owned" class="active"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9h9"/><circle cx="12" cy="12" r="9"/></svg><span>Owned</span></button><button data-tab="watch"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M1.5 12S5.5 5 12 5s10.5 7 10.5 7-4 7-10.5 7S1.5 12 1.5 12z"/><circle cx="12" cy="12" r="3"/></svg><span>Watchlist</span></button><button data-tab="sold"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l3 3 5-6"/></svg><span>Sold</span></button>
+  <button data-tab="history" class="sec"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17l5-6 4 3 8-9"/><path d="M3 21h18"/></svg><span>History</span></button><button data-tab="accounts"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/><path d="M7 15h4"/></svg><span>Accounts</span></button><button data-tab="schedule" class="sec"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span>Schedule</span></button><button data-tab="log" class="sec"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z"/><path d="M8 9h8M8 13h8M8 17h5"/></svg><span>Log</span></button><button type="button" class="more-btn" id="tabMore" aria-label="More: History, Schedule, Log"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg><span>More</span></button>
+</nav>
+<main>
+  <section class="tab active fill" id="tab-owned"></section><section class="tab fill" id="tab-watch"></section><section class="tab fill" id="tab-sold"></section>
+  <section class="tab scroll" id="tab-history"></section><section class="tab fill" id="tab-accounts"></section><section class="tab scroll" id="tab-schedule"></section><section class="tab fill" id="tab-log"></section>
+</main>
+<div id="modalRoot"></div>
+<datalist id="accl"></datalist>
+<div id="toasts"></div>
+<?!= include('client') ?>
+</body>
+</html>

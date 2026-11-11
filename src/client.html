@@ -1,0 +1,1533 @@
+<script>
+(function () {
+'use strict';
+
+// ------------------------------------------------------------------ helpers
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const NA = '<span class="na">N/A</span>';
+const isNum = v => typeof v === 'number' && isFinite(v);
+const nf = (v, dp) => isNum(v) ? v.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp }) : null;
+const money = v => nf(v, 2) || NA;
+const priceF = v => isNum(v) ? (nf(v, Math.abs(v) < 10 ? 4 : 2)) : NA;
+const qtyF = v => isNum(v) ? v.toLocaleString(undefined, { maximumFractionDigits: 8 }) : NA;
+const pctF = v => isNum(v) ? (v > 0 ? '+' : '') + nf(v, 2) + '%' : NA;
+const signed = v => isNum(v) ? (v > 0 ? '+' : '') + nf(v, 2) : NA;
+const plCls = v => !isNum(v) ? '' : v > 0 ? 'pos' : v < 0 ? 'neg' : '';
+const today = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+const FN = { owned: 'getOwnedData', watch: 'getWatchlistData', sold: 'getSoldData', history: 'getHistoryData', accounts: 'getAccountsData', log: 'getLogData', schedule: 'getSchedule' };
+
+function call(fn) {
+  const args = Array.prototype.slice.call(arguments, 1);
+  return new Promise(resolve => {
+    try {
+      google.script.run
+        .withSuccessHandler(res => resolve(res || { success: false, message: 'Empty response from server', data: null }))
+        .withFailureHandler(err => resolve({ success: false, message: (err && err.message) || String(err), data: null }))[fn].apply(null, args);
+    } catch (e) { resolve({ success: false, message: String(e), data: null }); }
+  });
+}
+
+function toast(msg, type) {
+  const t = document.createElement('div');
+  t.className = 'toast ' + (type || '');
+  t.textContent = msg;
+  t.onclick = () => t.remove();
+  $('#toasts').appendChild(t);
+  if (type !== 'error') setTimeout(() => t.remove(), 4000);     // errors stay until dismissed
+}
+
+// ------------------------------------------------------------------ phone layout (index.html sets html.phone early; this keeps it in step with the window)
+const mq = window.matchMedia('(max-width: 760px), (max-height: 500px) and (pointer: coarse)');
+let PHONE = mq.matches;
+document.documentElement.classList.toggle('phone', PHONE);
+const phoneUi = { filters: {} };                       // per tab: is the folded filter panel open?
+const PH_BTNS = '<button class="btn ph-only" data-act="filters" aria-label="Filters"><span>Filters</span><span class="fcount"></span></button><button class="btn ph-only" data-act="more" aria-label="More actions">&#8943;</button>';
+const sph = t => PHONE ? 'Search' : t;                  // shorter placeholder in the narrow search box
+const kv = (l, v, cls) => '<div class="kv' + (cls ? ' ' + cls : '') + '"><span>' + l + '</span><b>' + v + '</b></div>';
+function syncFilters(tab) {                             // number of active filters on the Filters button
+  const el = root(tab), c = $('.fcount', el);
+  if (c) { const n = $$('.tbf select', el).filter(x => x.id !== 'f-sort' && x.value !== '').length; c.textContent = n ? String(n) : ''; }
+}
+function afterRender(tab) {
+  const tb = $('.toolbar', root(tab));
+  if (tb && !tb.classList.contains('inline')) tb.classList.toggle('fopen', !!phoneUi.filters[tab]);
+  syncFilters(tab);
+}
+
+// ------------------------------------------------------------------ state
+const state = { tab: 'owned', owned: null, watch: null, sold: null, history: null, accounts: null, log: null, schedule: null, info: null };
+let ACCOUNTS = [];                                   // known account names (datalist + filters)
+function setAccounts(list) {
+  ACCOUNTS = (list || []).slice();
+  const dl = $('#accl');
+  if (dl) dl.innerHTML = ACCOUNTS.map(a => '<option value="' + esc(a) + '"></option>').join('');
+}
+function lastAccount() { let v = ''; try { v = localStorage.getItem('lastAccount') || ''; } catch (e) { v = ''; } return ACCOUNTS.indexOf(v) >= 0 ? v : (ui.owned.account || ACCOUNTS[0] || ''); }
+function rememberAccount(a) { try { localStorage.setItem('lastAccount', a); } catch (e) { /* storage may be blocked */ } }
+const ui = {
+  owned: { market: '', q: '', sort: 'name', account: '', tk: '', open: {} }, watch: { market: '', q: '', sort: 'name', status: '' },
+  sold: { market: '', q: '', sort: 'sellDate', account: '', year: '' }, log: { status: '', q: '' }, history: { account: 'ALL', range: '90' }
+};
+const colSort = {};
+let SYMBOLS = [];                                   // the Symbols tab, loaded once at start and refreshed after each confirmed add
+async function loadSymbols() { const r = await call('getSymbols'); if (r.success && Array.isArray(r.data)) SYMBOLS = r.data; }
+function rankSymbols(v) {                           // exact symbol > symbol prefix > name prefix > contains
+  const lv = v.toLowerCase(), out = [];
+  SYMBOLS.forEach(s => {
+    const t = s.ticker.toLowerCase(), sym = t.split(':')[1] || t, n = (s.name || '').toLowerCase();
+    const score = (t === lv || sym === lv) ? 0 : (sym.startsWith(lv) || t.startsWith(lv)) ? 1 : n.startsWith(lv) ? 2 : (t.includes(lv) || n.includes(lv)) ? 3 : -1;
+    if (score >= 0) out.push([score, s]);
+  });
+  out.sort((a, b) => a[0] - b[0]);
+  return out.slice(0, 8).map(x => x[1]);
+}
+
+// ------------------------------------------------------------------ saved preferences (column widths / hidden columns) + cash state
+let PREFS = { cols: {} }, prefsTimer = null, lastResize = 0, ACCOUNT_CASH = {};
+const tp = tab => (PREFS.cols[tab] = PREFS.cols[tab] || { hidden: [], widths: {} });
+function savePrefs() { clearTimeout(prefsTimer); prefsTimer = setTimeout(() => call('saveUiPrefs', PREFS), 600); }
+async function loadPrefs() {
+  const r = await call('getUiPrefs');
+  if (r.success && r.data && r.data.cols) { PREFS = r.data; applyView(); if (state[state.tab]) render(state.tab); }
+}
+/** The last sort of Owned, Watchlist and Sold is saved with the column layout and restored at start. Anything unknown (an older save, a renamed column) is ignored. */
+function applyView() {
+  const v = PREFS.view || {}, P = { owned: ownedPresets, watch: watchPresets, sold: soldPresets }, C = { owned: ownedCols, watch: watchCols, sold: soldCols };
+  Object.keys(P).forEach(t => {
+    const x = v[t];
+    if (!x) return;
+    if (x.sort && P[t][x.sort]) ui[t].sort = x.sort;
+    if (x.col && C[t].some(c => c.sort === x.col.key)) colSort[t] = { key: x.col.key, dir: x.col.dir }; else delete colSort[t];
+  });
+}
+function saveView(tab) {
+  if (['owned', 'watch', 'sold'].indexOf(tab) < 0) return;
+  PREFS.view = PREFS.view || {};
+  PREFS.view[tab] = { sort: ui[tab].sort, col: colSort[tab] || null };
+  savePrefs();
+}
+function cashFor(a) { const k = String(a || '').trim().toLowerCase(), n = Object.keys(ACCOUNT_CASH).find(x => x.toLowerCase() === k); return n ? ACCOUNT_CASH[n] : null; }
+const cashTxt = c => (nf(c.cash, 2) || '0.00') + ' ' + c.ccy;
+const TABLE_TABS = { owned: 1, watch: 1, sold: 1, log: 1, accounts: 1 };
+const DEFAULT_W = {
+  owned: { ticker: 215, account: 190, market: 84, name: 220, currency: 64, buyDate: 108, lastBuyDate: 108, buyPrice: 140, qty: 90, price: 135, totalCost: 135, totalActual: 145, pl: 115, plPct: 95, allocPct: 90, high52: 105, low52: 105, quoteTime: 140, note: 240, c19: 90 },
+  watch: { ticker: 175, market: 84, name: 230, currency: 64, wstatus: 95, price: 140, change: 100, changePct: 105, high52: 105, low52: 105, quoteTime: 140, note: 240, c12: 60 },
+  sold: { ticker: 175, account: 190, market: 84, name: 210, currency: 64, buyDate: 108, buyPrice: 105, sellDate: 108, sellPrice: 105, qty: 90, realized: 125, fx: 95, realizedEur: 160, note: 240, c14: 130 },
+  log: { time: 160, action: 150, details: 560, status: 90 },
+  accounts: { name: 170, holdings: 95, sold: 60, invested: 125, value: 115, realized: 130, cash: 175, cashEur: 105, total: 115, c9: 300 }
+};
+const colKey = (c, i) => c.key || c.sort || ('c' + i);
+
+// ------------------------------------------------------------------ research links (open in a new tab)
+const US_PAGES = ['NASDAQ', 'NYSE', 'NYSEARCA', 'NYSEAMERICAN'];
+/** Links for one listing. ticker is EXCHANGE:SYMBOL; ysym is the verified/mapped Yahoo symbol. */
+function researchLinks(ticker, ysym, name) {
+  const i = String(ticker).indexOf(':'), exch = String(ticker).slice(0, i), sym = String(ticker).slice(i + 1), enc = encodeURIComponent, y = ysym || sym;
+  const out = [{ label: 'Yahoo Finance', note: 'Quote, chart and key statistics', url: 'https://finance.yahoo.com/quote/' + enc(y) + '/' },
+    { label: 'Yahoo Finance: analyst view', note: 'Ratings, price targets and estimates (stocks; not for most ETFs)', url: 'https://finance.yahoo.com/quote/' + enc(y) + '/analysis/' }];
+  if (US_PAGES.indexOf(exch) >= 0 && /^[A-Z0-9]+$/.test(sym)) out.push({ label: 'Perplexity Finance', note: 'AI-assisted page for this ticker', url: 'https://www.perplexity.ai/finance/' + enc(sym) });
+  else out.push({ label: 'Perplexity search', note: 'Asks about this stock: analyst ratings, targets, outlook', url: 'https://www.perplexity.ai/search?q=' + enc((name || sym) + ' (' + sym + ' on ' + exch + ') stock: analyst ratings, price target, valuation and outlook') });
+  out.push({ label: 'Google Finance', note: 'Quote and news (not every listing exists there)', url: 'https://www.google.com/finance/quote/' + enc(sym) + ':' + enc(exch) });
+  return out;
+}
+window.__links = { researchLinks };
+/** Notes: a small icon next to the ticker (filled when a note exists), a Note column in the tables, and a note line on the phone cards. */
+const NOTE_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z"/><path d="M14 3v5h5"/><path d="M8.5 13h7M8.5 17h5"/></svg>';
+const noteAttr = (k, r) => ' data-act="note" data-k="' + k + '" data-t="' + esc(r.ticker) + '"' + (k === 'owned' ? ' data-a="' + esc(r.account) + '"' : '') + (k === 'sold' ? ' data-s="' + esc(r.saleId || '') + '"' : '');
+const noteBtn = (k, r) => '<button type="button" class="nb' + (r.note ? ' has' : '') + '"' + noteAttr(k, r) + ' title="' + (r.note ? esc(r.note.length > 400 ? r.note.slice(0, 400) + '...' : r.note) : 'Add a note') + '" aria-label="' + (r.note ? 'Edit note' : 'Add note') + '">' + NOTE_SVG + '</button>';
+const noteCell = (k, r) => r.note ? '<span class="notetxt"' + noteAttr(k, r) + ' title="' + esc(r.note) + '">' + esc(r.note) + '</span>' : '';
+const noteLine = (k, r) => r.note ? '<div class="pc-note"' + noteAttr(k, r) + '>' + NOTE_SVG + '<span>' + esc(r.note) + '</span></div>' : '';
+const tkBtn = r => '<button class="tk" data-act="links" data-t="' + esc(r.ticker) + '" data-y="' + esc(r.ysym || '') + '" data-n="' + esc(r.name || '') + '" title="Open research links (Yahoo, Perplexity, Google)">' + esc(r.ticker) + '</button>';
+function closeLinkMenu() { $$('.linkmenu,.linkback').forEach(x => x.remove()); }
+function openLinkMenu(btn) {
+  closeLinkMenu();
+  const links = researchLinks(btn.dataset.t, btn.dataset.y, btn.dataset.n), m = document.createElement('div');
+  m.className = 'linkmenu';
+  const canSplit = !!btn.closest('#tab-owned');                                  // a split concerns shares you hold, so only the Owned tab offers it
+  m.innerHTML = '<div class="lh"><div class="lt"><b>' + esc(btn.dataset.t) + '</b><span>' + esc(btn.dataset.n || '') + '</span></div>' + (canSplit ? '<button type="button" class="btn lsplit" title="Adjust quantity and buy price after a stock split (every account)">Stock split&hellip;</button>' : '') + '</div>' +
+    links.map(l => '<a href="' + esc(l.url) + '" target="_blank" rel="noopener noreferrer">' + esc(l.label) + '<span class="ext">&#8599;</span><small>' + esc(l.note) + '</small></a>').join('') +
+    '<div class="muted small" style="padding:6px 10px 2px">Opens in a new tab. Ratings are opinions, not advice.</div><button type="button" class="btn lclose">Close</button>';
+  if (PHONE) { const bk = document.createElement('div'); bk.className = 'linkback'; document.body.appendChild(bk); }
+  document.body.appendChild(m);
+  const r = btn.getBoundingClientRect(), w = m.offsetWidth, hgt = m.offsetHeight;
+  m.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+  m.style.top = (r.bottom + 4 + hgt > window.innerHeight ? Math.max(8, r.top - hgt - 4) : r.bottom + 4) + 'px';
+  m.addEventListener('click', e => { const sp = e.target.closest('.lsplit'); setTimeout(closeLinkMenu, 0); if (sp) openSplit(btn.dataset.t); });
+}
+/** The Owned toolbar's Import / Export dropdown. */
+function openIoMenu(btn) {
+  closeLinkMenu();
+  const m = document.createElement('div');
+  m.className = 'linkmenu iomenu';
+  m.setAttribute('role', 'menu');
+  m.innerHTML = '<button type="button" role="menuitem" data-io="import">Import from spreadsheet&hellip;<small>Paste rows copied from Excel or Google Sheets</small></button>' +
+    '<button type="button" role="menuitem" data-io="export">Export to CSV&hellip;<small>Download or copy your holdings, per position or per lot</small></button>';
+  document.body.appendChild(m);
+  const r = btn.getBoundingClientRect(), w = m.offsetWidth, hgt = m.offsetHeight;
+  m.style.left = Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8)) + 'px';
+  m.style.top = (r.bottom + 4 + hgt > window.innerHeight ? Math.max(8, r.top - hgt - 4) : r.bottom + 4) + 'px';
+  m.addEventListener('click', e => { const b = e.target.closest('[data-io]'); if (!b) return; closeLinkMenu(); if (b.dataset.io === 'import') openImport(); else openExport('owned'); });
+  const first = $('button', m); if (first) first.focus();
+}
+document.addEventListener('mousedown', e => { if (!e.target.closest('.linkmenu') && !e.target.closest('.tk') && !e.target.closest('[data-act=ioMenu]')) closeLinkMenu(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLinkMenu(); });
+window.addEventListener('resize', closeLinkMenu);
+
+// ------------------------------------------------------------------ generic table
+function cmp(a, b) {
+  const an = a == null || (typeof a === 'number' && !isFinite(a)), bn = b == null || (typeof b === 'number' && !isFinite(b));
+  if (an && bn) return 0; if (an) return 1; if (bn) return -1;           // nulls always last
+  return typeof a === 'number' && typeof b === 'number' ? a - b : String(a).localeCompare(String(b));
+}
+function sortRows(rows, key, dir) {
+  const out = rows.slice();
+  out.sort((x, y) => {
+    const a = x[key], b = y[key];
+    const an = a == null, bn = b == null;
+    const c = (an || bn) ? cmp(a, b) : cmp(a, b) * dir;                  // keep nulls last regardless of direction
+    return c || cmp(x.ticker, y.ticker) || cmp(x.account, y.account);    // ties: same ticker stay together, accounts in order
+  });
+  return out;
+}
+function tableHtml(tab, cols, rows, rowAttr, extra) {
+  const cs = colSort[tab], fx = !!TABLE_TABS[tab], pf = fx ? tp(tab) : { hidden: [], widths: {} };
+  // the first column and the action column are always shown; every other column can be hidden
+  const meta = cols.map((c, i) => ({ c, i, k: colKey(c, i) })).filter(m => !(m.i > 0 && m.c.label !== '' && pf.hidden.indexOf(m.k) >= 0));
+  const wOf = m => Math.max(40, Math.min(1200, pf.widths[m.k] || (DEFAULT_W[tab] || {})[m.k] || 110));
+  const total = meta.reduce((a, m) => a + wOf(m), 0);
+  let h = '<table' + (fx ? ' class="fx" style="width:max(100%,' + total + 'px)"' : '') + '>' + (fx ? '<colgroup>' + meta.map(m => '<col data-k="' + m.k + '" style="width:' + wOf(m) + 'px">').join('') + '</colgroup>' : '') +
+    '<thead><tr>' + meta.map(m => '<th class="' + (m.c.num ? 'num ' : '') + (m.c.sort ? 'sortable' : '') + (m.c.label === '' ? ' act' : '') + '" data-sort="' + (m.c.sort || '') + '" data-k="' + m.k + '">' + m.c.label +
+      (cs && m.c.sort && cs.key === m.c.sort ? (cs.dir > 0 ? ' &#9650;' : ' &#9660;') : '') + (fx && m.c.label !== '' ? '<span class="rz" data-k="' + m.k + '" title="Drag to resize, double-click to fit"></span>' : '') + '</th>').join('') + '</tr></thead><tbody>';
+  if (!rows.length) h += '<tr><td colspan="' + meta.length + '" class="empty">No data</td></tr>';
+  rows.forEach(r => {
+    h += '<tr' + (rowAttr ? rowAttr(r) : '') + '>' + meta.map(m => '<td class="' + (m.c.num ? 'num ' : '') + (m.c.cls ? m.c.cls(r) : '') + (m.c.label === '' ? ' act' : '') + '">' + m.c.html(r) + '</td>').join('') + '</tr>' + (extra ? extra(r, meta.length) : '');
+  });
+  return h + '</tbody></table>';
+}
+function badge(r) {
+  if (!r.pstatus || r.pstatus === 'OK') return '';
+  const tip = 'Quote time: ' + (r.quoteTime || 'n/a') + ' | Source: ' + (r.source || '?') + (r.writer ? ' (' + r.writer + ')' : '');
+  return '<span class="badge ' + esc(r.pstatus.toLowerCase()) + '" title="' + esc(tip) + '">' + esc(r.pstatus) + '</span>';
+}
+function marketOptions(rows, sel) {
+  const ms = Array.from(new Set(rows.map(r => r.market).filter(Boolean))).sort();
+  return '<option value="">All markets</option>' + ms.map(m => '<option value="' + esc(m) + '"' + (m === sel ? ' selected' : '') + '>' + esc(m) + '</option>').join('');
+}
+function filtered(rows, u) {
+  const q = (u.q || '').toLowerCase();
+  return rows.filter(r => (!u.market || r.market === u.market) && (!u.status || r.wstatus === u.status) && (!u.account || r.account === u.account) &&
+    (!u.year || String(r.sellDate || '').slice(0, 4) === u.year) && (!u.tk || r.ticker === u.tk) && (!q || (r.ticker + ' ' + (r.name || '') + ' ' + (r.account || '') + ' ' + (r.note || '')).toLowerCase().includes(q)));
+}
+function accountOptions(sel, allLabel) { return '<option value="">' + allLabel + '</option>' + ACCOUNTS.map(a => '<option value="' + esc(a) + '"' + (a === sel ? ' selected' : '') + '>' + esc(a) + '</option>').join(''); }
+function applySort(tab, rows, presets) {
+  const cs = PHONE ? null : colSort[tab];
+  if (cs) return sortRows(rows, cs.key, cs.dir);
+  const p = presets[ui[tab].sort] || Object.values(presets)[0];
+  return sortRows(rows, p[0], p[1]);
+}
+function selectHtml(id, opts, cur) { return '<select id="' + id + '">' + opts.map(o => '<option value="' + o[0] + '"' + (o[0] === cur ? ' selected' : '') + '>' + o[1] + '</option>').join('') + '</select>'; }
+
+// ------------------------------------------------------------------ tab loading
+function root(tab) { return $('#tab-' + tab); }
+async function loadTab(tab, force) {
+  const el = root(tab);
+  if (!force && state[tab]) return render(tab);
+  el.innerHTML = '<div class="loading"><span class="spin"></span>Loading...</div>';
+  const res = await call(FN[tab]);
+  if (!res.success) { el.innerHTML = '<div class="warnbox">Could not load: ' + esc(res.message) + ' <button class="btn" data-act="reload">Retry</button></div>'; return; }
+  state[tab] = res.data;
+  if (tab === 'owned' && res.data.cash) ACCOUNT_CASH = res.data.cash;
+  if (tab === 'accounts') setAccounts(res.data.accounts.map(a => a.name)); else if (res.data.accounts && typeof res.data.accounts[0] === 'string') setAccounts(res.data.accounts);
+  render(tab);
+}
+function invalidate() {
+  state.owned = state.watch = state.sold = state.log = state.accounts = null;
+  loadTab(state.tab, true);
+  loadInfo();
+}
+function render(tab) { ({ owned: renderOwned, watch: renderWatch, sold: renderSold, history: renderHistory, accounts: renderAccounts, schedule: renderSchedule, log: renderLog })[tab](); }
+
+// ------------------------------------------------------------------ OWNED
+const rowKey = r => r.ticker + '\u241F' + r.account;
+const actAttr = r => ' data-t="' + esc(r.ticker) + '" data-a="' + esc(r.account) + '"';
+/** The same ticker held in other accounts is a separate position per account. Each row says so, and a click shows all of them together. */
+let alsoIdx = {};                                       // ticker -> every position of it (rebuilt by fillOwned, from all rows, whatever the filters)
+const othersOf = r => (alsoIdx[r.ticker] || []).filter(x => x.account !== r.account);
+const alsoFull = o => o.map(x => x.account + ': ' + qtyF(x.qty)).join(', ');
+const alsoTxt = o => o.length === 1 ? o[0].account + ': ' + qtyF(o[0].qty) : o.length + ' other accounts: ' + qtyF(+o.reduce((a, x) => a + (+x.qty || 0), 0).toFixed(8));       // short enough for the column; the tooltip lists them all
+const alsoTip = (r, o) => 'Also held in ' + alsoFull(o) + '. Click to show every position of ' + r.ticker + '.';
+const alsoBtn = r => { const o = othersOf(r); return o.length ? '<button type="button" class="also" data-act="tkfilter" data-t="' + esc(r.ticker) + '" title="' + esc(alsoTip(r, o)) + '">Also in ' + esc(alsoTxt(o)) + '</button>' : ''; };
+const alsoLine = r => { const o = othersOf(r); return o.length ? '<div class="pc-also" data-act="tkfilter" data-t="' + esc(r.ticker) + '" title="' + esc(alsoTip(r, o)) + '"><span>Also in ' + esc(alsoTxt(o)) + '</span><b>Show all &rsaquo;</b></div>' : ''; };
+const ownedCols = [
+  { label: 'Ticker', sort: 'ticker', html: r => '<button class="icon" data-act="toggle"' + actAttr(r) + ' title="Show the lots (purchases)">' + (ui.owned.open[rowKey(r)] ? '&#9662;' : '&#9656;') + '</button>' + tkBtn(r) + noteBtn('owned', r) + (r.lotCount > 1 ? '<span class="sub">' + r.lotCount + ' lots</span>' : '') },
+  { label: 'Account', sort: 'account', html: r => esc(r.account) + alsoBtn(r) },
+  { label: 'Market', sort: 'market', html: r => esc(r.market) },
+  { label: 'Name', sort: 'name', html: r => esc(r.name) },
+  { label: 'Ccy', sort: 'currency', html: r => esc(r.currency) },
+  { label: 'First Buy', sort: 'buyDate', html: r => esc(r.buyDate) },
+  { label: 'Last Buy', sort: 'lastBuyDate', html: r => esc(r.lastBuyDate) },
+  { label: 'Avg Buy Price', sort: 'buyPrice', num: true, html: r => priceF(r.buyPrice) },
+  { label: 'Qty', sort: 'qty', num: true, html: r => qtyF(r.qty) },
+  { label: 'Actual Price', sort: 'price', num: true, html: r => priceF(r.price) + badge(r) },
+  { label: 'Total Cost', sort: 'totalCost', num: true, html: r => money(r.totalCost) + '<span class="sub">' + esc(r.majorCcy) + '</span>' },
+  { label: 'Total Actual', sort: 'totalActual', num: true, html: r => money(r.totalActual) + (isNum(r.totalActual) ? '<span class="sub">' + esc(r.majorCcy) + '</span>' : '') },
+  { label: 'P/L', sort: 'pl', num: true, cls: r => plCls(r.pl), html: r => signed(r.pl) },
+  { label: 'P/L %', sort: 'plPct', num: true, cls: r => plCls(r.plPct), html: r => pctF(r.plPct) },
+  { label: 'Alloc %', sort: 'allocPct', num: true, html: r => isNum(r.allocPct) ? nf(r.allocPct, 1) + '%' : NA },
+  { label: '52w High', sort: 'high52', num: true, html: r => priceF(r.high52) },
+  { label: '52w Low', sort: 'low52', num: true, html: r => priceF(r.low52) },
+  { label: 'Quote Time', sort: 'quoteTime', html: r => r.quoteTime ? esc(r.quoteTime) : NA },
+  { key: 'note', label: 'Note', html: r => noteCell('owned', r) },
+  { label: '', html: r => '<button class="icon" data-act="edit"' + actAttr(r) + ' title="Edit name / account of this position">&#9998;</button><button class="icon" data-act="del"' + actAttr(r) + ' title="Delete the whole position (no Sold record)">&#128465;</button>' }
+];
+function lotsHtml(r, n) {
+  if (!ui.owned.open[rowKey(r)]) return '';
+  const rows = r.lots.map(l => '<tr><td>' + esc(l.buyDate) + '</td><td class="num">' + (l.daysHeld == null ? NA : l.daysHeld + ' d') + '</td><td class="num">' + priceF(l.buyPrice) + '</td><td class="num">' + qtyF(l.qty) + '</td>' +
+    '<td class="num">' + money(l.totalActual) + '<span class="sub">' + esc(r.majorCcy) + '</span></td><td class="num ' + plCls(l.pl) + '">' + signed(l.pl) + '</td><td class="num ' + plCls(l.plPct) + '">' + pctF(l.plPct) + '</td>' +
+    '<td>' + (l.best ? '<span class="pill active">best</span>' : '') + (l.worst ? '<span class="pill paused">worst</span>' : '') + '</td>' +
+    '<td><button class="btn" data-act="sellLot"' + actAttr(r) + ' data-l="' + esc(l.lotId) + '">Sell this lot</button> <button class="icon" data-act="editLot"' + actAttr(r) + ' data-l="' + esc(l.lotId) + '" title="Edit price, quantity or date of this lot">&#9998;</button>' +
+    '<button class="icon" data-act="delLot"' + actAttr(r) + ' data-l="' + esc(l.lotId) + '" title="Delete this lot (no Sold record)">&#128465;</button></td></tr>').join('');
+  return '<tr class="lotrow"><td colspan="' + n + '"><table class="lots"><thead><tr><th>Bought</th><th class="num">Held</th><th class="num">Buy price</th><th class="num">Qty</th><th class="num">Value</th><th class="num">P/L</th><th class="num">Return</th><th></th><th></th></tr></thead><tbody>' + rows + '</tbody></table></td></tr>';
+}
+/* ---- phone cards ---- */
+function lotCard(r, l) {
+  const A = actAttr(r) + ' data-l="' + esc(l.lotId) + '"';
+  return '<div class="pc-lot"><div class="pc-r"><b>' + esc(l.buyDate) + '</b><span class="pc-p ' + plCls(l.pl) + '">' + (isNum(l.plPct) ? signed(l.pl) + ' &middot; ' + pctF(l.plPct) : 'N/A') + '</span></div>' +
+    '<div class="pc-r"><span class="pc-m">' + qtyF(l.qty) + ' @ ' + priceF(l.buyPrice) + (l.daysHeld == null ? '' : ' &middot; ' + l.daysHeld + ' d') + (l.best ? ' <span class="pill active">best</span>' : '') + (l.worst ? ' <span class="pill paused">worst</span>' : '') + '</span>' +
+    '<span class="pc-m">' + money(l.totalActual) + ' ' + esc(r.majorCcy) + '</span></div>' +
+    '<div class="pc-lot-b"><button class="btn sm" data-act="sellLot"' + A + '>Sell this lot</button><button class="icon" data-act="editLot"' + A + ' aria-label="Edit lot">&#9998;</button><button class="icon" data-act="delLot"' + A + ' aria-label="Delete lot">&#128465;</button></div></div>';
+}
+function ownedCard(r) {
+  const open = !!ui.owned.open[rowKey(r)], A = actAttr(r), ccy = esc(r.currency);
+  let h = '<div class="pc' + (open ? ' open' : '') + '"><div class="pc-head" data-act="toggle"' + A + '>' +
+    '<div class="pc-r"><div class="pc-id">' + tkBtn(r) + noteBtn('owned', r) + (r.lotCount > 1 ? '<span class="sub">' + r.lotCount + ' lots</span>' : '') + badge(r) + '</div><div class="pc-val">' + (isNum(r.totalActual) ? money(r.totalActual) + '<span class="sub">' + esc(r.majorCcy) + '</span>' : NA) + '</div></div>' +
+    '<div class="pc-r"><span class="pc-m">' + esc(r.name) + '</span><span class="pc-p ' + plCls(r.pl) + '">' + (isNum(r.plPct) ? signed(r.pl) + ' &middot; ' + pctF(r.plPct) : 'N/A') + '</span></div>' +
+    '<div class="pc-r"><span class="pc-m">' + esc(r.account) + '</span><span class="pc-m">' + qtyF(r.qty) + ' &times; ' + priceF(r.price) + '<span class="pc-chev">&#9662;</span></span></div></div>' + alsoLine(r) + noteLine('owned', r);
+  if (open) {
+    h += '<div class="pc-det">' + kv('Quantity', qtyF(r.qty)) + kv('Avg buy price', priceF(r.buyPrice) + ' ' + ccy) + kv('Actual price', priceF(r.price) + ' ' + ccy) + kv('Total cost', money(r.totalCost) + ' ' + esc(r.majorCcy)) +
+      kv('Allocation', isNum(r.allocPct) ? nf(r.allocPct, 1) + '%' : NA) + kv('Market', esc(r.market)) + kv('52w low', priceF(r.low52)) + kv('52w high', priceF(r.high52)) +
+      kv('First buy', esc(r.buyDate)) + kv('Last buy', esc(r.lastBuyDate)) + kv('Quote time', r.quoteTime ? esc(r.quoteTime) : NA, 'full') + '</div>' +
+      '<div class="pc-lots">' + r.lots.map(l => lotCard(r, l)).join('') + '</div>' +
+      '<div class="pc-act"><button class="btn primary" data-act="sell"' + A + '>Sell...</button><button class="btn" data-act="edit"' + A + '>Edit</button><button class="btn" data-act="del"' + A + '>Delete</button></div>';
+  }
+  return h + '</div>';
+}
+const cardList = (rows, fn, empty) => rows.length ? '<div class="pcs">' + rows.map(fn).join('') + '</div>' : '<div class="loading">' + (empty || 'No data') + '</div>';
+function watchCard(r) {
+  const st = String(r.wstatus || '');
+  return '<div class="pc"><div class="pc-head" data-act="wrow" data-t="' + esc(r.ticker) + '">' +
+    '<div class="pc-r"><div class="pc-id">' + tkBtn(r) + noteBtn('watch', r) + badge(r) + (st && st !== 'Active' ? '<span class="pill ' + esc(st.toLowerCase()) + '">' + esc(st) + '</span>' : '') + '</div><div class="pc-val">' + priceF(r.price) + (isNum(r.price) ? '<span class="sub">' + esc(r.currency) + '</span>' : '') + '</div></div>' +
+    '<div class="pc-r"><span class="pc-m">' + esc(r.name) + '</span><span class="pc-p ' + plCls(r.changePct) + '">' + (isNum(r.changePct) ? pctF(r.changePct) : 'N/A') + '</span></div>' +
+    '<div class="pc-r"><span class="pc-m">' + esc(r.market) + (r.quoteTime ? ' &middot; ' + esc(r.quoteTime) : '') + '</span><span class="pc-m">52w ' + priceF(r.low52) + ' &ndash; ' + priceF(r.high52) + '</span></div></div>' + noteLine('watch', r) + '</div>';
+}
+function soldCard(r) {
+  const mc = r.currency === 'GBX' ? 'GBP' : r.currency;
+  return '<div class="pc"><div class="pc-head" style="cursor:default">' +
+    '<div class="pc-r"><div class="pc-id">' + tkBtn(r) + noteBtn('sold', r) + '</div><div class="pc-val ' + plCls(r.realizedEur) + '">' + (isNum(r.realizedEur) ? signed(r.realizedEur) + '<span class="sub">EUR</span>' : NA) + '</div></div>' +
+    '<div class="pc-r"><span class="pc-m">' + esc(r.name) + '</span><span class="pc-p ' + plCls(r.realized) + '">' + signed(r.realized) + ' ' + esc(mc) + '</span></div>' +
+    '<div class="pc-r"><span class="pc-m">' + esc(r.account) + '</span><span class="pc-m">' + qtyF(r.qty) + ' sold</span></div>' +
+    '<div class="pc-r"><span class="pc-m">Bought ' + esc(r.buyDate) + ' @ ' + priceF(r.buyPrice) + '</span></div><div class="pc-r"><span class="pc-m">Sold ' + esc(r.sellDate) + ' @ ' + priceF(r.sellPrice) + '</span><span class="pc-m">FX ' + (nf(r.fx, 4) || 'N/A') + '</span></div></div>' + noteLine('sold', r) +
+    (r.canWatch ? '<div class="pc-act"><button class="btn sm" data-act="sw" data-t="' + esc(r.ticker) + '">+ Add to Watchlist</button></div>' : '') + '</div>';
+}
+function accountCard(r) {
+  const A = accA(r), tracked = r.cash !== null;
+  return '<div class="pc"><div class="pc-head" style="cursor:default"><div class="pc-r"><b class="pc-id">' + esc(r.name) + '</b><div class="pc-val">' + (isNum(r.totalEur) ? money(r.totalEur) + '<span class="sub">EUR total</span>' : NA) + '</div></div>' +
+    '<div class="pc-r"><span class="pc-m">' + r.holdings + ' holding' + (r.holdings === 1 ? '' : 's') + ' &middot; ' + r.sold + ' sold</span></div></div>' +
+    '<div class="pc-det">' + kv('Invested (EUR)', isNum(r.investedEur) ? money(r.investedEur) : NA) + kv('Value (EUR)', isNum(r.valueEur) ? money(r.valueEur) : NA) +
+    kv('Realized (EUR)', '<span class="' + plCls(r.realizedEur) + '">' + signed(r.realizedEur) + '</span>') +
+    kv('Available cash', tracked ? money(r.cash) + '<span class="sub">' + esc(r.cashCcy) + '</span>' : '<span class="na">not tracked</span>') +
+    (tracked ? kv('Cash (EUR)', isNum(r.cashEur) ? money(r.cashEur) : NA) : '') + '</div>' +
+    '<div class="pc-act"><button class="btn sm" data-act="setCash"' + A + '>' + (tracked ? 'Edit cash' : 'Set cash...') + '</button>' + (tracked ? '<button class="btn sm" data-act="adjCash"' + A + '>Adjust</button><button class="btn sm" data-act="cashLog"' + A + '>Cash log</button>' : '') +
+    '<button class="btn sm" data-act="renameAcc"' + A + '>Rename</button><button class="btn sm" data-act="delAcc"' + A + (r.holdings || r.sold || (tracked && r.cash !== 0) ? ' disabled' : '') + '>Delete</button></div></div>';
+}
+function logCard(r) {
+  const cls = r.status === 'Error' ? 'neg' : r.status === 'Warning' ? 'badge suspect' : 'muted';
+  return '<div class="pc"><div class="pc-log"><div class="pc-r"><b>' + esc(r.action) + '</b><span class="small ' + cls + '">' + esc(r.status) + '</span></div><div class="pc-m small">' + esc(r.time) + '</div><div class="pc-m" style="margin-top:4px">' + esc(r.details) + '</div></div></div>';
+}
+
+const ownedPresets = { name: ['name', 1], ticker: ['ticker', 1], alloc: ['allocPct', -1], plpct: ['plPct', -1], prox: ['pos52', -1] };
+
+/** Totals for a set of rows. Never silently wrong: any missing price/FX makes the totals N/A and names the rows. */
+function totalsOf(rows, eurhuf) {
+  const missing = rows.filter(r => !isNum(r.valueEur)).map(r => r.ticker + ' (' + r.account + ')');
+  const good = missing.length === 0, eur = rows.reduce((a, r) => a + (isNum(r.valueEur) ? r.valueEur : 0), 0), pl = rows.reduce((a, r) => a + (isNum(r.plEur) ? r.plEur : 0), 0);
+  rows.forEach(r => { r.allocPct = (good && eur > 0) ? r.valueEur / eur * 100 : null; });
+  return { eur: good ? eur : null, huf: (good && isNum(eurhuf)) ? eur * eurhuf : null, plEur: good ? pl : null, missing };
+}
+function renderOwned() {
+  const d = state.owned, u = ui.owned, el = root('owned');
+  const scope = u.account ? d.rows.filter(r => r.account === u.account) : d.rows, t = totalsOf(scope, d.totals.eurhuf);
+  const card = (lbl, v, extra) => '<div class="card"><div class="lbl">' + lbl + '</div><div class="val ' + (extra || '') + '">' + (isNum(v) ? nf(v, 2) : 'N/A') + '</div></div>';
+  let h = '';
+  if (t.missing.length) h += '<div class="warnbox">&#9888; Totals show N/A because a price or FX rate is missing for: <b>' + esc(t.missing.join(', ')) + '</b>.</div>';
+  const scopeTxt = u.account ? ' &middot; ' + esc(u.account) : '';
+  h += '<div class="cards">' + card('Portfolio Value (EUR)' + scopeTxt, t.eur) + (d.showHuf ? card('Portfolio Value (HUF)' + scopeTxt, t.huf) : '') + card('Unrealised P/L (EUR)' + scopeTxt, t.plEur, plCls(t.plEur)) +
+    (u.account && cashFor(u.account) ? '<div class="card"><div class="lbl">Available cash &middot; ' + esc(u.account) + '</div><div class="val">' + nf(cashFor(u.account).cash, 2) + '<span class="sub" style="font-size:14px"> ' + esc(cashFor(u.account).ccy) + '</span></div></div>' : '') + '</div>';
+  h += '<div class="toolbar"><span class="tbf"><select id="f-account">' + accountOptions(u.account, 'All accounts') + '</select><select id="f-market">' + marketOptions(scope, u.market) + '</select></span>' +
+    '<input id="f-q" type="search" placeholder="' + sph('Search ticker, name, account or note') + '" value="' + esc(u.q) + '">' +
+    '<span class="tbf">' + selectHtml('f-sort', [['name', 'Sort: Name (A-Z)'], ['ticker', 'Sort: Ticker'], ['alloc', 'Sort: Allocation'], ['plpct', 'Sort: P/L %'], ['prox', 'Sort: Near 52w high']], u.sort) + '</span>' + PH_BTNS +
+    '<span class="grow"></span><button class="btn hide-ph" data-act="cols" title="Show, hide and resize columns">Columns</button><button class="btn" data-act="toggleAll" data-more="' + (scope.length && scope.every(r => u.open[rowKey(r)]) ? 'Collapse all' : 'Expand all') + '" title="Show or hide the lots of every position">' + (scope.length && scope.every(r => u.open[rowKey(r)]) ? 'Hide all lots' : 'Show all lots') + '</button><button class="btn" data-act="reload" data-more="Reload" title="Reload">&#8635;</button><button class="btn hide-ph" data-act="ioMenu" aria-haspopup="menu" title="Import rows from a spreadsheet, or export your holdings">Import / Export &#9662;</button>' +
+    '<button class="btn hide-dt" data-act="export" data-more="Export CSV..." data-hint="Download or copy your holdings">Export...</button><button class="btn hide-dt" data-act="import" data-more="Import..." data-hint="Paste rows from a spreadsheet (easier on a computer)">Import...</button><button class="btn primary" data-act="add">+ Add</button></div><div id="fbar"></div><div class="table-wrap" id="tbl"></div>';
+  el.innerHTML = h;
+  fillOwned();
+  afterRender('owned');
+}
+function fillOwned() {
+  alsoIdx = {};
+  state.owned.rows.forEach(r => { (alsoIdx[r.ticker] = alsoIdx[r.ticker] || []).push(r); });
+  if (ui.owned.tk && !alsoIdx[ui.owned.tk]) ui.owned.tk = '';             // the ticker was sold or deleted meanwhile
+  const rows = applySort('owned', filtered(state.owned.rows, ui.owned), ownedPresets), fb = $('#fbar', root('owned'));
+  if (fb) fb.innerHTML = ui.owned.tk ? '<div class="fbar"><span>Showing only <b>' + esc(ui.owned.tk) + '</b> &middot; ' + rows.length + ' position' + (rows.length === 1 ? '' : 's') + '</span><button type="button" class="btn" data-act="tkclear">Show all</button></div>' : '';
+  $('#tbl', root('owned')).innerHTML = PHONE ? cardList(rows, ownedCard, 'Nothing owned yet. Tap + Add.') : tableHtml('owned', ownedCols, rows, r => ' class="click" data-act="sell"' + actAttr(r), lotsHtml);
+}
+
+// ------------------------------------------------------------------ WATCHLIST
+const watchCols = [
+  { label: 'Ticker', sort: 'ticker', html: r => tkBtn(r) + noteBtn('watch', r) },
+  { label: 'Market', sort: 'market', html: r => esc(r.market) },
+  { label: 'Name', sort: 'name', html: r => esc(r.name) },
+  { label: 'Ccy', sort: 'currency', html: r => esc(r.currency) },
+  { label: 'Status', sort: 'wstatus', html: r => '<span class="pill ' + esc(String(r.wstatus).toLowerCase()) + '">' + esc(r.wstatus) + '</span>' },
+  { label: 'Actual Price', sort: 'price', num: true, html: r => priceF(r.price) + badge(r) },
+  { label: 'Change', sort: 'change', num: true, cls: r => plCls(r.change), html: r => isNum(r.change) ? (r.change > 0 ? '+' : '') + nf(r.change, Math.abs(r.change) < 10 ? 4 : 2) : NA },
+  { label: 'Change %', sort: 'changePct', num: true, cls: r => plCls(r.changePct), html: r => pctF(r.changePct) },
+  { label: '52w High', sort: 'high52', num: true, html: r => priceF(r.high52) },
+  { label: '52w Low', sort: 'low52', num: true, html: r => priceF(r.low52) },
+  { label: 'Quote Time', sort: 'quoteTime', html: r => r.quoteTime ? esc(r.quoteTime) : NA },
+  { key: 'note', label: 'Note', html: r => noteCell('watch', r) },
+  { label: '', html: r => '<button class="icon" data-act="del" data-t="' + esc(r.ticker) + '" title="Delete row">&#128465;</button>' }
+];
+const watchPresets = { name: ['name', 1], ticker: ['ticker', 1], chg: ['changePct', -1], low: ['changePct', 1] };
+function renderWatch() {
+  const d = state.watch, u = ui.watch;
+  root('watch').innerHTML = '<div class="toolbar"><span class="tbf"><select id="f-market">' + marketOptions(d.rows, u.market) + '</select>' +
+    selectHtml('f-status', [['', 'All statuses'], ['Active', 'Active'], ['Paused', 'Paused']], u.status) + '</span>' +
+    '<input id="f-q" type="search" placeholder="' + sph('Search ticker, name or note') + '" value="' + esc(u.q) + '">' +
+    '<span class="tbf">' + selectHtml('f-sort', [['name', 'Sort: Name (A-Z)'], ['ticker', 'Sort: Ticker'], ['chg', 'Sort: Biggest gain'], ['low', 'Sort: Biggest drop']], u.sort) + '</span>' + PH_BTNS +
+    '<span class="grow"></span><button class="btn hide-ph" data-act="cols" title="Show, hide and resize columns">Columns</button><button class="btn" data-act="reload" data-more="Reload">&#8635;</button><button class="btn" data-act="removePaused" data-more="Remove all Paused" data-hint="Deletes every paused row">Remove all Paused</button><button class="btn primary" data-act="add">+ Add</button></div>' +
+    '<div class="table-wrap" id="tbl"></div>';
+  fillWatch();
+  afterRender('watch');
+}
+function fillWatch() {
+  const rows = applySort('watch', filtered(state.watch.rows, ui.watch), watchPresets);
+  $('#tbl', root('watch')).innerHTML = PHONE ? cardList(rows, watchCard, 'The Watchlist is empty. Tap + Add.') : tableHtml('watch', watchCols, rows, r => ' class="click" data-act="wrow" data-t="' + esc(r.ticker) + '"');
+}
+
+// ------------------------------------------------------------------ SOLD
+const soldCols = [
+  { label: 'Ticker', sort: 'ticker', html: r => tkBtn(r) + noteBtn('sold', r) },
+  { label: 'Account', sort: 'account', html: r => esc(r.account) },
+  { label: 'Market', sort: 'market', html: r => esc(r.market) },
+  { label: 'Name', sort: 'name', html: r => esc(r.name) },
+  { label: 'Ccy', sort: 'currency', html: r => esc(r.currency) },
+  { label: 'Buy Date', sort: 'buyDate', html: r => esc(r.buyDate) },
+  { label: 'Buy Price', sort: 'buyPrice', num: true, html: r => priceF(r.buyPrice) },
+  { label: 'Sell Date', sort: 'sellDate', html: r => esc(r.sellDate) },
+  { label: 'Sell Price', sort: 'sellPrice', num: true, html: r => priceF(r.sellPrice) },
+  { label: 'Sold Qty', sort: 'qty', num: true, html: r => qtyF(r.qty) },
+  { label: 'Realized P/L', sort: 'realized', num: true, cls: r => plCls(r.realized), html: r => signed(r.realized) },
+  { label: 'FX to EUR', sort: 'fx', num: true, html: r => nf(r.fx, 4) || NA },
+  { label: 'Realized P/L (EUR)', sort: 'realizedEur', num: true, cls: r => plCls(r.realizedEur), html: r => signed(r.realizedEur) },
+  { key: 'note', label: 'Note', html: r => noteCell('sold', r) },
+  { label: '', html: r => r.canWatch ? '<button class="btn" data-act="sw" data-t="' + esc(r.ticker) + '">+ Watchlist</button>' : '' }
+];
+const soldPresets = { sellDate: ['sellDate', -1], name: ['name', 1], ticker: ['ticker', 1] };
+function renderSold() {
+  const d = state.sold, u = ui.sold;
+  const years = Array.from(new Set(d.rows.map(r => String(r.sellDate).slice(0, 4)).filter(Boolean))).sort().reverse();
+  const scope = d.rows.filter(r => (!u.account || r.account === u.account) && (!u.year || String(r.sellDate).slice(0, 4) === u.year));
+  const eur = scope.reduce((a, r) => a + (isNum(r.realizedEur) ? r.realizedEur : 0), 0), huf = isNum(d.totals.eurhuf) ? eur * d.totals.eurhuf : null;
+  const lbl = (u.account ? ' &middot; ' + esc(u.account) : '') + (u.year ? ' &middot; ' + esc(u.year) : '');
+  root('sold').innerHTML = '<div class="cards"><div class="card"><div class="lbl">Realized P/L (EUR)' + lbl + '</div><div class="val ' + plCls(eur) + '">' + signed(eur) + '</div></div>' +
+    '<div class="card"><div class="lbl">Realized P/L (HUF) at today\'s rate' + lbl + '</div><div class="val ' + plCls(huf) + '">' + (isNum(huf) ? signed(huf) : 'N/A') + '</div></div></div>' +
+    '<div class="toolbar"><span class="tbf"><select id="f-account">' + accountOptions(u.account, 'All accounts') + '</select>' +
+    '<select id="f-year"><option value="">All years</option>' + years.map(y => '<option' + (y === u.year ? ' selected' : '') + '>' + y + '</option>').join('') + '</select>' +
+    '<select id="f-market">' + marketOptions(d.rows, u.market) + '</select></span><input id="f-q" type="search" placeholder="' + sph('Search ticker, name, account or note') + '" value="' + esc(u.q) + '">' +
+    '<span class="tbf">' + selectHtml('f-sort', [['sellDate', 'Sort: Sell date (newest)'], ['name', 'Sort: Name (A-Z)'], ['ticker', 'Sort: Ticker']], u.sort) + '</span>' + PH_BTNS + '<span class="grow"></span><button class="btn hide-ph" data-act="cols" title="Show, hide and resize columns">Columns</button><button class="btn" data-act="reload" data-more="Reload">&#8635;</button><button class="btn" data-act="export" data-more="Export CSV..." data-hint="Download or copy the sold history">Export...</button></div>' +
+    '<div class="table-wrap" id="tbl"></div>';
+  fillSold();
+  afterRender('sold');
+}
+function fillSold() {
+  const rows = applySort('sold', filtered(state.sold.rows, ui.sold), soldPresets);
+  $('#tbl', root('sold')).innerHTML = PHONE ? cardList(rows, soldCard, 'Nothing sold yet.') : tableHtml('sold', soldCols, rows);
+}
+
+// ------------------------------------------------------------------ SCHEDULE
+function renderSchedule() {
+  const d = state.schedule, pad = h => String(h).padStart(2, '0') + ':00';
+  const intro = '<p class="muted">Hours are in the ' + esc(d.timeZone || 'script') + ' time zone. The hourly trigger checks this table and only refreshes in the hours ticked here.</p>';
+  if (PHONE) {
+    root('schedule').innerHTML = intro + '<label class="chk"><input type="checkbox" id="wk"' + (d.weekdaysOnly ? ' checked' : '') + '> <span>Weekdays only (Mon-Fri)</span></label>' +
+      '<div class="hgrid">' + d.hours.map(x => '<label class="hchip"><input type="checkbox" class="hr" data-h="' + x.hour + '"' + (x.run ? ' checked' : '') + '><span>' + pad(x.hour) + '</span></label>').join('') + '</div>' +
+      '<button class="btn primary" data-act="saveSched" style="width:100%">Save schedule</button>';
+    return;
+  }
+  let h = intro +
+    '<div class="toolbar"><label><input type="checkbox" id="wk"' + (d.weekdaysOnly ? ' checked' : '') + '> Weekdays only (Mon-Fri)</label><span class="grow"></span>' +
+    '<button class="btn" data-act="reload">&#8635;</button><button class="btn primary" data-act="saveSched">Save</button></div>' +
+    '<div class="table-wrap sched"><table><thead><tr><th>Hour</th><th>Run?</th></tr></thead><tbody>';
+  d.hours.forEach(x => { h += '<tr><td>' + pad(x.hour) + '</td><td><input type="checkbox" class="hr" data-h="' + x.hour + '"' + (x.run ? ' checked' : '') + '></td></tr>'; });
+  root('schedule').innerHTML = h + '</tbody></table></div>';
+}
+
+// ------------------------------------------------------------------ LOG
+const logCols = [
+  { key: 'time', label: 'Timestamp', html: r => esc(r.time) }, { key: 'action', label: 'Action', html: r => esc(r.action) },
+  { key: 'details', label: 'Details', html: r => '<span style="white-space:normal">' + esc(r.details) + '</span>' },
+  { key: 'status', label: 'Status', html: r => '<span class="' + (r.status === 'Error' ? 'neg' : r.status === 'Warning' ? 'badge suspect' : '') + '">' + esc(r.status) + '</span>' }
+];
+function renderLog() {
+  const u = ui.log;
+  root('log').innerHTML = '<div class="toolbar"><span class="tbf">' + selectHtml('f-status', [['', 'All statuses'], ['Success', 'Success'], ['Warning', 'Warning'], ['Error', 'Error']], u.status) + '</span>' +
+    '<input id="f-q" type="search" placeholder="' + sph('Search log') + '" value="' + esc(u.q) + '">' + PH_BTNS + '<span class="grow"></span>' +
+    '<button class="btn hide-ph" data-act="cols" title="Show, hide and resize columns">Columns</button><button class="btn" data-act="reload" data-more="Reload">&#8635;</button><button class="btn" data-act="archive" data-more="Archive year..." data-hint="Copy the spreadsheet, then start a fresh year">Archive year...</button><button class="btn danger" data-act="clearLog" data-more="Clear Log" data-hint="Deletes all log rows">Clear Log</button></div>' +
+    '<div class="table-wrap" id="tbl"></div>';
+  fillLog();
+  afterRender('log');
+}
+function fillLog() {
+  const u = ui.log, q = (u.q || '').toLowerCase();
+  const rows = state.log.rows.filter(r => (!u.status || r.status === u.status) && (!q || (r.action + ' ' + r.details).toLowerCase().includes(q)));
+  $('#tbl', root('log')).innerHTML = PHONE ? cardList(rows.slice(0, 200), logCard, 'No log rows.') + (rows.length > 200 ? '<p class="muted small" style="text-align:center">Showing the latest 200 of ' + rows.length + '. Use the search to narrow it down.</p>' : '') : tableHtml('log', logCols, rows);
+}
+
+// ------------------------------------------------------------------ modal infrastructure
+let modalEl = null;
+function closeModal() { if (modalEl) { modalEl.remove(); modalEl = null; } document.body.classList.remove('modal-open'); }
+function openModal(o) {
+  closeModal();
+  const ov = document.createElement('div');
+  ov.className = 'overlay';
+  ov.innerHTML = '<div class="modal' + (o.wide ? ' wide' : '') + '"><h2>' + esc(o.title) + '</h2><div class="body">' + o.body + '</div><div class="foot"><button class="btn" data-m="cancel">' + esc(o.cancelLabel || 'Cancel') + '</button>' +
+    (o.submit ? '<button class="btn ' + (o.danger ? 'danger' : 'primary') + '" data-m="submit">' + esc(o.submit) + '</button>' : '') + '</div></div>';
+  ov.addEventListener('mousedown', e => { if (e.target === ov) closeModal(); });
+  ov.addEventListener('click', async e => {
+    const b = e.target.closest('[data-m]');
+    if (!b) return;
+    if (b.dataset.m === 'cancel') return closeModal();
+    if (b.dataset.m === 'submit' && o.onSubmit) {
+      b.disabled = true;
+      const old = b.textContent;
+      b.innerHTML = '<span class="spin"></span>' + esc(old);
+      let keep = false;
+      try { keep = (await o.onSubmit(ov)) === false; } finally { if (modalEl === ov) { b.disabled = false; b.textContent = old; } }
+      if (!keep && modalEl === ov) closeModal();
+    }
+  });
+  document.body.appendChild(ov);
+  document.body.classList.add('modal-open');
+  modalEl = ov;
+  if (o.onOpen) o.onOpen(ov);
+  return ov;
+}
+function setErr(m, msg) { let e = $('.err', m); if (!e) { e = document.createElement('div'); e.className = 'err'; $('.body', m).appendChild(e); } e.textContent = msg || ''; }
+function confirmModal(title, text, label, danger) {
+  return new Promise(resolve => {
+    let done = false;
+    const m = openModal({ title, body: '<p>' + text + '</p>', submit: label, danger, onSubmit: () => { done = true; resolve(true); } });
+    new MutationObserver((_, ob) => { if (!document.body.contains(m)) { ob.disconnect(); if (!done) resolve(false); } }).observe(document.body, { childList: true });
+  });
+}
+async function mutate(promise, okMsg) {
+  const r = await promise;
+  if (r.success) { toast(okMsg || r.message); invalidate(); } else toast(r.message, 'error');
+  return r;
+}
+
+// ------------------------------------------------------------------ ADD (owned + watchlist)
+function openAdd(kind) {
+  const owned = kind === 'owned';
+  let meta = null, timer = null;
+  const body = '<div class="field"><label>Search a symbol, or type EXCHANGE:SYMBOL</label><div class="ac"><input id="q" autocomplete="off" placeholder="e.g. ASML, NASDAQ:GOOGL, ETR:2B70, BUD:OTP"><div class="ac-list hidden" id="acl"></div></div></div>' +
+    '<div id="rbox" class="resolve hidden"></div>' +
+    '<div id="yfield" class="field hidden"><label>Yahoo symbol override (optional, e.g. 2B70.DE)</label><input id="ysym"><div style="margin-top:6px"><button class="btn" id="retry" type="button">Retry resolve</button></div></div>' +
+    '<div id="fields" class="hidden"><div class="field"><label>Instrument name (editable)</label><input id="nm"></div>' +
+    (owned ? '<div class="field"><label>Account (pick one, or type a new name)</label><input id="acc" list="accl" autocomplete="off" value="' + esc(lastAccount()) + '"><div class="muted small" style="margin-top:4px">Each purchase is saved as its own lot, so you can later see what every purchase has returned.</div></div><div class="row2"><div class="field"><label>Buy price (quote units)</label><input id="bp" type="number" step="any" min="0"></div><div class="field"><label>Quantity</label><input id="qty" type="number" step="any" min="0"></div></div>' +
+      '<div class="field"><label>Buy date</label><input id="bd" type="date" value="' + today() + '" max="' + today() + '"></div>' +
+      '<div class="field hidden" id="cashrow"><label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="dedc" checked style="width:auto"><span>Deduct the cost from the account\'s available cash (<span id="cashbal"></span>)</span></label></div>' : '') +
+    '<div class="field"><label>Note (optional)' + (owned ? ': when to sell, whether to buy more. If you already hold it in this account, the line is added to its note.' : ': why you are watching it, what would make you buy') + '</label><textarea id="note" rows="2" maxlength="4000" placeholder="' + (owned ? 'e.g. sell half above 220, add below 140' : 'e.g. buy if it dips to 160 after earnings') + '"></textarea></div></div>';
+  const m = openModal({
+    title: owned ? 'Add to Owned' : 'Add to Watchlist', body, submit: 'Add', onOpen: ov => { $('#q', ov).focus(); $('[data-m=submit]', ov).disabled = true; },
+    onSubmit: async ov => {
+      if (!meta) return false;
+      const data = { ticker: meta.ticker, name: $('#nm', ov).value.trim(), yahooSymbol: meta.yahooSymbol, note: $('#note', ov).value };
+      let r;
+      if (owned) {
+        data.buyPrice = $('#bp', ov).value; data.quantity = $('#qty', ov).value; data.buyDate = $('#bd', ov).value; data.account = $('#acc', ov).value.trim(); data.deductCash = cashFor(data.account) ? $('#dedc', ov).checked : true;
+        r = await call('addOwnedRow', data);
+        if (!r.success && r.data && r.data.code === 'ON_WATCHLIST') {
+          closeModal();
+          if (await confirmModal('Move to Owned?', esc(meta.ticker) + ' is on your Watchlist. Move it to Owned with these values?', 'Move to Owned')) {
+            rememberAccount(data.account);
+            await mutate(call('moveWatchlistToOwned', meta.ticker, Number(data.buyPrice), data.buyDate, Number(data.quantity), data.account, data.deductCash, data.note.trim() ? data.note : null));
+          }
+          return;
+        }
+      } else r = await call('addWatchlistRow', data);
+      if (r.success) { if (owned) rememberAccount(data.account); toast(r.message); invalidate(); loadSymbols(); return true; }
+      setErr(ov, r.message); return false;
+    }
+  });
+  const q = $('#q', m), list = $('#acl', m);
+  if (owned) {                                                // show the cash checkbox when the chosen account tracks cash
+    const syncCash = () => { const cc = cashFor($('#acc', m).value); $('#cashrow', m).classList.toggle('hidden', !cc); if (cc) $('#cashbal', m).textContent = cashTxt(cc); };
+    $('#acc', m).addEventListener('input', syncCash); syncCash();
+  }
+  async function pick(t, yo) {
+    list.classList.add('hidden');
+    q.value = t; meta = null;
+    $('#fields', m).classList.add('hidden'); $('[data-m=submit]', m).disabled = true; setErr(m, '');
+    const rb = $('#rbox', m);
+    rb.className = 'resolve'; rb.innerHTML = '<span class="spin"></span>Resolving ' + esc(t) + ' (can take up to ~15 s)...';
+    const r = await call('resolveInstrument', t, yo || '');
+    if (!modalEl || modalEl !== m) return;
+    if (!r.success) {
+      rb.className = 'resolve bad'; rb.textContent = r.message;
+      $('#yfield', m).classList.remove('hidden'); return;
+    }
+    meta = r.data;
+    $('#yfield', m).classList.add('hidden');
+    rb.className = 'resolve';
+    rb.innerHTML = '<b>' + esc(meta.ticker) + '</b> &middot; ' + esc(meta.market) + ' &middot; quoted in <b>' + esc(meta.currency) + '</b>' +
+      (meta.currency === 'GBX' ? ' (pence; amounts are shown in GBP)' : '') + ' &middot; source ' + esc(meta.source) + (isNum(meta.price) ? ' &middot; price ' + priceF(meta.price) : '') +
+      (meta.status && meta.status !== 'OK' ? ' &middot; <b>' + esc(meta.status) + '</b>' : '');
+    $('#nm', m).value = meta.name || '';
+    $('#fields', m).classList.remove('hidden'); $('[data-m=submit]', m).disabled = false;
+    if (owned) { if (!$('#bp', m).value && isNum(meta.price)) $('#bp', m).value = meta.price; $('#qty', m).focus(); }
+  }
+  function suggest() {
+    const v = q.value.trim();
+    if (v.length < 2) return list.classList.add('hidden');
+    const hits = rankSymbols(v), typed = v.toUpperCase();
+    let h = hits.map(s => '<div class="ac-item" data-t="' + esc(s.ticker) + '"><span class="t">' + esc(s.ticker) + '</span> <span class="muted">' + esc(s.name) + '</span></div>').join('');
+    if (/^[A-Z]+:[A-Z0-9][A-Z0-9.\-_]*$/.test(typed) && !hits.some(s => s.ticker === typed)) h += '<div class="ac-item" data-t="' + esc(typed) + '">Use <span class="t">' + esc(typed) + '</span> as typed</div>';
+    if (!hits.length && !h) h = '<div class="ac-item muted">No match in your list. Type the full EXCHANGE:SYMBOL, e.g. NASDAQ:GOOGL</div>';
+    h += '<div class="ac-item online" data-online="1">&#128269; Search online for &ldquo;' + esc(v) + '&rdquo;</div>';
+    list.innerHTML = h;
+    list.classList.remove('hidden');
+  }
+  async function searchOnline() {
+    const v = q.value.trim();
+    list.innerHTML = '<div class="ac-item muted"><span class="spin"></span>Searching online...</div>';
+    const r = await call('searchOnline', v);
+    if (!modalEl || modalEl !== m) return;
+    if (!r.success) { list.innerHTML = '<div class="ac-item muted">Online search unavailable, type the ticker manually.</div>'; return; }
+    list.innerHTML = r.data.length
+      ? r.data.map(s => '<div class="ac-item" data-t="' + esc(s.ticker) + '" data-y="' + esc(s.yahoo) + '"><span class="t">' + esc(s.ticker) + '</span> <span class="muted">' + esc(s.name) + ' &middot; ' + esc(s.market) + '</span></div>').join('')
+      : '<div class="ac-item muted">No online matches. Type the full EXCHANGE:SYMBOL.</div>';
+  }
+  q.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(suggest, 500); });         // debounce 500 ms, 2+ chars
+  q.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); const f = $('.ac-item[data-t]', list); if (f && !list.classList.contains('hidden')) pick(f.dataset.t, f.dataset.y); else if (/^[A-Za-z]+:/.test(q.value)) pick(q.value.trim().toUpperCase()); } });
+  list.addEventListener('mousedown', e => {
+    e.preventDefault();
+    if (e.target.closest('[data-online]')) return searchOnline();
+    const it = e.target.closest('[data-t]');
+    if (it) pick(it.dataset.t, it.dataset.y);
+  });
+  $('#retry', m).addEventListener('click', () => pick(q.value.trim().toUpperCase(), $('#ysym', m).value.trim()));
+}
+
+// ------------------------------------------------------------------ SELL
+function openSell(t, a, lotId) {
+  const r = state.owned.rows.find(x => x.ticker === t && x.account === a);
+  if (!r) return;
+  const fxKnown = isNum(r.fxEur), lots = r.lots, rnd = x => Math.round(x * 1e8) / 1e8;
+  const lotRow = l => '<tr><td data-lbl="Bought">' + esc(l.buyDate) + '</td><td class="num" data-lbl="Held">' + (l.daysHeld == null ? '&ndash;' : l.daysHeld + ' d') + '</td><td class="num" data-lbl="Buy price">' + priceF(l.buyPrice) + '</td><td class="num" data-lbl="Available">' + qtyF(l.qty) + '</td>' +
+    '<td class="num ret" data-lbl="Return at this price" data-ret="' + esc(l.lotId) + '"></td><td class="num lsell" data-lbl="Quantity to sell"><input class="lq" data-l="' + esc(l.lotId) + '" type="number" step="any" min="0" value="0" style="width:92px"></td></tr>';
+  const body = '<p><b>' + esc(r.ticker) + '</b> &middot; ' + esc(r.name) + '<br><span class="muted">' + esc(r.account) + ' &middot; owned ' + qtyF(r.qty) + ' in ' + r.lotCount + ' lot' + (r.lotCount === 1 ? '' : 's') + ', average ' + priceF(r.buyPrice) + ' ' + esc(r.currency) + '</span></p>' +
+    (r.note ? '<div class="notebox"><b>Your note on this position</b><div>' + esc(r.note) + '</div></div>' : '') +
+    '<div class="row2"><div class="field"><label>Sell price (' + esc(r.currency) + ')</label><input id="sp" type="number" step="any" value="' + (isNum(r.price) ? r.price : '') + '"></div>' +
+    '<div class="field"><label>Quantity to sell</label><input id="sq" type="number" step="any" value="' + r.qty + '"></div></div>' +
+    '<div class="field"><label>Which lots to sell from</label><select id="sm"><option value="fifo">Oldest first (FIFO)</option><option value="best">Best return first</option><option value="worst">Worst return first</option><option value="manual">I choose the quantities below</option></select></div>' +
+    '<div class="table-wrap lotbox" style="max-height:30vh;margin-bottom:12px"><table class="lots"><thead><tr><th>Bought</th><th class="num">Held</th><th class="num">Buy price</th><th class="num">Available</th><th class="num">Return at this price</th><th class="num">Sell</th></tr></thead><tbody>' + lots.map(lotRow).join('') + '</tbody></table></div>' +
+    '<div class="row2"><div class="field"><label>Sell date</label><input id="sd" type="date" value="' + today() + '" max="' + today() + '"></div>' +
+    '<div class="field"><label>FX ' + esc(r.majorCcy) + ' &rarr; EUR' + (fxKnown ? ' (frozen at sale)' : ' (enter manually)') + '</label><input id="fx" type="number" step="any" value="' + (fxKnown ? r.fxEur : '') + '"' + (fxKnown ? ' readonly' : '') + '></div></div>' +
+    '<div class="field"><label>Why are you selling? (optional, saved with the sale)</label><textarea id="why" rows="2" maxlength="4000" placeholder="e.g. reached my target, thesis changed, need the cash"></textarea>' + (r.note ? '<div class="muted small" style="margin-top:4px">If you sell everything, your note on this position is added to the sale\'s note.</div>' : '') + '</div>' +
+    '<div class="resolve" id="prev"></div><div class="field" id="wl"><label><input type="checkbox" id="aw" style="width:auto"> Add to Watchlist after selling everything</label></div>' +
+    (cashFor(r.account) ? '<div class="field"><label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="addc" checked style="width:auto"><span>Add the proceeds to the account\'s available cash (' + esc(cashTxt(cashFor(r.account))) + ')</span></label></div>' : '');
+  openModal({
+    title: 'Sell', body, submit: 'Record sale', wide: lots.length > 3,
+    onOpen: m => {
+      const sp = () => Number($('#sp', m).value), sqEl = $('#sq', m), smEl = $('#sm', m), lqs = () => $$('.lq', m);
+      const ret = l => sp() > 0 ? (sp() - l.buyPrice) / l.buyPrice * 100 : null, rv = l => { const v = ret(l); return v === null ? 0 : v; };
+      const allocate = (method, q) => {
+        const order = lots.slice();
+        if (method === 'best') order.sort((x, y) => rv(y) - rv(x)); else if (method === 'worst') order.sort((x, y) => rv(x) - rv(y));
+        const out = {}; let left = q;
+        order.forEach(l => { const take = Math.min(l.qty, Math.max(0, left)); out[l.lotId] = rnd(take); left = rnd(left - take); });
+        return out;
+      };
+      const summarize = () => {
+        const sel = lqs().map(i => ({ l: lots.find(x => x.lotId === i.dataset.l), q: Number(i.value) || 0 })).filter(x => x.q > 0);
+        const total = rnd(sel.reduce((s, x) => s + x.q, 0)), fx = Number($('#fx', m).value);
+        const pl = sel.reduce((s, x) => s + (sp() - x.l.buyPrice) * x.q / r.divisor, 0);
+        $('#prev', m).innerHTML = sel.length && sp() > 0 ? 'Selling <b>' + qtyF(total) + '</b> from ' + sel.length + ' lot' + (sel.length === 1 ? '' : 's') + ': realized P/L <b class="' + plCls(pl) + '">' + signed(pl) + ' ' + esc(r.majorCcy) + '</b>' + (fx > 0 ? ' &asymp; <b class="' + plCls(pl) + '">' + signed(pl * fx) + ' EUR</b>' : '') : 'Choose how much to sell.';
+        $('#wl', m).classList.toggle('hidden', Math.abs(total - rnd(r.qty)) > 1e-9);
+      };
+      const paintReturns = () => lots.forEach(l => { const v = ret(l), el = $('[data-ret="' + l.lotId + '"]', m); el.className = 'num ret ' + plCls(v); el.textContent = v === null ? '' : pctF(v); });
+      const apply = () => { if (smEl.value !== 'manual') { const out = allocate(smEl.value, Number(sqEl.value) || 0); lqs().forEach(i => { i.value = out[i.dataset.l]; }); } summarize(); };
+      $('#sp', m).addEventListener('input', () => { paintReturns(); apply(); });
+      sqEl.addEventListener('input', () => { if (smEl.value === 'manual') smEl.value = 'fifo'; apply(); });
+      smEl.addEventListener('input', apply);
+      $('#fx', m).addEventListener('input', summarize);
+      lqs().forEach(i => i.addEventListener('input', () => { smEl.value = 'manual'; sqEl.value = rnd(lqs().reduce((s, x) => s + (Number(x.value) || 0), 0)); summarize(); }));
+      paintReturns();
+      if (lotId) {                                           // "Sell this lot": that lot, fully
+        const l = lots.find(x => x.lotId === lotId);
+        smEl.value = 'manual'; lqs().forEach(i => { i.value = i.dataset.l === lotId ? l.qty : 0; }); sqEl.value = l ? l.qty : r.qty; summarize();
+      } else apply();
+    },
+    onSubmit: async m => {
+      const plan = $$('.lq', m).map(i => ({ lotId: i.dataset.l, qty: Number(i.value) || 0 })).filter(x => x.qty > 0), total = rnd(plan.reduce((s, x) => s + x.qty, 0));
+      if (!plan.length) { setErr(m, 'Enter a quantity for at least one lot.'); return false; }
+      const res = await call('recordSell', r.ticker, r.account, Number($('#sp', m).value), total, $('#sd', m).value, fxKnown ? null : $('#fx', m).value, $('#aw', m).checked, plan, cashFor(r.account) ? $('#addc', m).checked : true, $('#why', m).value);
+      if (res.success) { toast(res.message); invalidate(); return true; }
+      setErr(m, res.message); return false;
+    }
+  });
+}
+
+// ------------------------------------------------------------------ NOTES
+const NOTE_INFO = {
+  watch: { title: 'Watchlist note', hint: 'Why you are watching it and what would make you buy: a price, an event, something to check.' },
+  owned: { title: 'Position note', hint: 'Your plan for this position: when to sell, whether to buy more, what to watch. If you sell everything it is copied into the sale\'s note.' },
+  sold: { title: 'Sale note', hint: 'Why you sold and what you would do differently. It belongs to the whole sale, so every lot sold in it shows the same note.' }
+};
+const NOTE_MAX = 4000;
+function noteRow(kind, t, a, saleId) {
+  const rows = ((kind === 'owned' ? state.owned : kind === 'watch' ? state.watch : state.sold) || {}).rows || [];
+  return rows.find(x => kind === 'sold' ? (!!saleId && x.saleId === saleId) : (x.ticker === t && (kind !== 'owned' || x.account === a)));
+}
+function openNote(kind, t, a, saleId) {
+  const r = noteRow(kind, t, a, saleId), info = NOTE_INFO[kind];
+  if (!info) return;
+  if (!r) { toast(kind === 'sold' && !saleId ? 'Reload the page, then add the note.' : 'That row is no longer in the list. Reload the page.', 'warn'); return; }
+  const m = openModal({
+    title: info.title + ': ' + r.ticker,
+    body: '<p class="muted small" style="margin-top:0">' + esc(r.name || '') + (kind === 'watch' ? '' : ' &middot; ' + esc(r.account)) + (kind === 'sold' ? ' &middot; sold ' + esc(r.sellDate) : '') + '</p>' +
+      '<div class="field"><label>' + esc(info.hint) + '</label><textarea id="nt" rows="8" maxlength="' + NOTE_MAX + '" placeholder="Type your note here"></textarea>' +
+      '<div class="noteft"><span class="muted small" id="ncnt"></span><button type="button" class="btn sm" id="nclr">Clear</button></div></div>',
+    submit: 'Save note',
+    onOpen: ov => {
+      const ta = $('#nt', ov), cnt = () => { $('#ncnt', ov).textContent = ta.value.length + ' / ' + NOTE_MAX; };
+      ta.value = r.note || ''; cnt(); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+      ta.addEventListener('input', cnt);
+      ta.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); $('[data-m=submit]', ov).click(); } });
+      $('#nclr', ov).addEventListener('click', () => { ta.value = ''; cnt(); ta.focus(); });
+    },
+    onSubmit: async ov => {
+      const text = $('#nt', ov).value.trim();
+      if (text === (r.note || '')) return;                                    // nothing changed
+      const res = await call('saveNote', kind, kind === 'sold' ? r.saleId : r.ticker, kind === 'owned' ? r.account : '', text);
+      if (!res.success) { setErr(ov, res.message); return false; }
+      const saved = (res.data && typeof res.data.note === 'string') ? res.data.note : text;
+      if (kind === 'sold') state.sold.rows.forEach(x => { if (x.saleId === r.saleId) x.note = saved; }); else r.note = saved;
+      ({ owned: fillOwned, watch: fillWatch, sold: fillSold })[kind]();
+      toast(res.message);
+    }
+  });
+  return m;
+}
+
+// ------------------------------------------------------------------ WATCHLIST row actions
+function openWatchRow(t) {
+  const r = state.watch.rows.find(x => x.ticker === t);
+  if (!r) return;
+  const m = openModal({
+    title: r.ticker, body: '<p>' + esc(r.name) + '<br><span class="muted">Status: ' + esc(r.wstatus) + '. Paused rows are frozen and not refreshed.</span></p>' +
+      '<div class="toolbar keep stack"><button class="btn" data-w="toggle">' + (r.wstatus === 'Active' ? 'Pause' : 'Resume') + '</button><button class="btn primary" data-w="move">Move to Owned...</button>' + (PHONE ? '<button class="btn danger" data-w="del">Remove from Watchlist</button>' : '') + '</div>'
+  });
+  m.addEventListener('click', async e => {
+    const b = e.target.closest('[data-w]');
+    if (!b) return;
+    if (b.dataset.w === 'toggle') { closeModal(); await mutate(call('toggleWatchlistStatus', t)); }
+    if (b.dataset.w === 'move') { closeModal(); openMove(r); }
+    if (b.dataset.w === 'del') { closeModal(); if (await confirmModal('Delete ' + t + '?', 'Remove this row from the Watchlist?', 'Delete', true)) mutate(call('deleteWatchlistRow', t)); }
+  });
+}
+function openMove(r) {
+  openModal({
+    title: 'Move ' + r.ticker + ' to Owned',
+    body: '<div class="field"><label>Account (pick one, or type a new name)</label><input id="acc" list="accl" autocomplete="off" value="' + esc(lastAccount()) + '"></div>' +
+      '<div class="row2"><div class="field"><label>Buy price (' + esc(r.currency) + ')</label><input id="bp" type="number" step="any" value="' + (isNum(r.price) ? r.price : '') + '"></div>' +
+      '<div class="field"><label>Quantity</label><input id="qty" type="number" step="any"></div></div><div class="field"><label>Buy date</label><input id="bd" type="date" value="' + today() + '" max="' + today() + '"></div>' +
+      '<div class="field hidden" id="cashrow"><label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="dedc" checked style="width:auto"><span>Deduct the cost from the account\'s available cash (<span id="cashbal"></span>)</span></label></div>' +
+      '<div class="field"><label>Note for this position' + (r.note ? ' (starts as your entry note; change it to your plan for holding)' : ' (optional)') + '</label><textarea id="mn" rows="3" maxlength="4000" placeholder="e.g. sell half above 220, add below 140">' + esc(r.note || '') + '</textarea></div>',
+    submit: 'Move to Owned',
+    onOpen: m => { const sync = () => { const cc = cashFor($('#acc', m).value); $('#cashrow', m).classList.toggle('hidden', !cc); if (cc) $('#cashbal', m).textContent = cashTxt(cc); }; $('#acc', m).addEventListener('input', sync); sync(); },
+    onSubmit: async m => {
+      const acc = $('#acc', m).value.trim();
+      const res = await call('moveWatchlistToOwned', r.ticker, Number($('#bp', m).value), $('#bd', m).value, Number($('#qty', m).value), acc, cashFor(acc) ? $('#dedc', m).checked : true, $('#mn', m).value);
+      if (res.success) { rememberAccount(acc); toast(res.message); invalidate(); return true; }
+      setErr(m, res.message); return false;
+    }
+  });
+}
+
+// ------------------------------------------------------------------ EDIT a holding
+function openEdit(t, a) {
+  const r = state.owned.rows.find(x => x.ticker === t && x.account === a);
+  if (!r) return;
+  openModal({
+    title: 'Edit ' + r.ticker,
+    body: '<p class="muted">Changes the name and/or account of all ' + r.lotCount + ' lot' + (r.lotCount === 1 ? '' : 's') + ' of this position. To correct a price, quantity or date, expand the position and edit that lot.</p>' +
+      '<div class="field"><label>Account (pick one, or type a new name)</label><input id="acc" list="accl" autocomplete="off" value="' + esc(r.account) + '"></div>' +
+      '<div class="field"><label>Instrument name</label><input id="nm" value="' + esc(r.name) + '"></div>',
+    submit: 'Save changes',
+    onSubmit: async m => {
+      const res = await call('editOwnedRow', { ticker: r.ticker, account: r.account, newAccount: $('#acc', m).value.trim(), name: $('#nm', m).value.trim() });
+      if (res.success) { toast(res.message); invalidate(); return true; }
+      setErr(m, res.message); return false;
+    }
+  });
+}
+function openEditLot(t, a, lotId) {
+  const r = state.owned.rows.find(x => x.ticker === t && x.account === a), l = r && r.lots.find(x => x.lotId === lotId);
+  if (!l) return;
+  openModal({
+    title: 'Edit lot of ' + r.ticker,
+    body: '<p class="muted">Corrects this purchase only. To record a sale or a new purchase use Sell or + Add, so the Sold history stays right.</p>' +
+      '<div class="row2"><div class="field"><label>Buy price (' + esc(r.currency) + ')</label><input id="bp" type="number" step="any" value="' + l.buyPrice + '"></div>' +
+      '<div class="field"><label>Quantity</label><input id="qty" type="number" step="any" value="' + l.qty + '"></div></div>' +
+      '<div class="field"><label>Buy date</label><input id="bd" type="date" value="' + esc(l.buyDate) + '" max="' + today() + '"></div>',
+    submit: 'Save lot',
+    onSubmit: async m => {
+      const res = await call('editLot', { lotId, buyPrice: $('#bp', m).value, quantity: $('#qty', m).value, buyDate: $('#bd', m).value });
+      if (res.success) { toast(res.message); invalidate(); return true; }
+      setErr(m, res.message); return false;
+    }
+  });
+}
+
+// ------------------------------------------------------------------ STOCK SPLIT
+function openSplit(pre) {
+  const tickers = Array.from(new Set(state.owned.rows.map(r => r.ticker))).sort();
+  if (!tickers.length) return toast('Nothing owned yet.', 'warn');
+  openModal({
+    title: 'Stock split',
+    body: '<p class="muted">Quantity is multiplied and the buy price divided by the ratio in every account, so total cost does not change. Use it when a company announces a split; then click Refresh Now.</p>' +
+      '<div class="field"><label>Ticker</label><select id="st">' + tickers.map(x => '<option' + (x === pre ? ' selected' : '') + '>' + esc(x) + '</option>').join('') + '</select></div>' +
+      '<div class="row2"><div class="field"><label>For every (old shares)</label><input id="so" type="number" step="any" min="0" value="1"></div><div class="field"><label>you now hold (new shares)</label><input id="sn" type="number" step="any" min="0" value="2"></div></div>' +
+      '<div class="resolve" id="sp"></div>',
+    submit: 'Apply split',
+    onOpen: m => {
+      const upd = () => {
+        const f = Number($('#sn', m).value) / Number($('#so', m).value), rows = state.owned.rows.filter(r => r.ticker === $('#st', m).value);
+        $('#sp', m).innerHTML = isFinite(f) && f > 0 ? rows.map(r => esc(r.account) + ': ' + qtyF(r.qty) + ' &rarr; <b>' + qtyF(Math.round(r.qty * f * 1e8) / 1e8) + '</b> shares, buy price ' + priceF(r.buyPrice) + ' &rarr; <b>' + priceF(r.buyPrice / f) + '</b>').join('<br>') : '';
+      };
+      $$('input,select', m).forEach(i => i.addEventListener('input', upd)); upd();
+    },
+    onSubmit: async m => {
+      const res = await call('applySplit', $('#st', m).value, Number($('#sn', m).value), Number($('#so', m).value));
+      if (res.success) { toast(res.message); invalidate(); return true; }
+      setErr(m, res.message); return false;
+    }
+  });
+}
+
+// ------------------------------------------------------------------ EXPORT (CSV)
+function openExport(kind) {
+  const sold = kind === 'sold', years = Array.from(new Set((state.sold ? state.sold.rows : []).map(r => String(r.sellDate).slice(0, 4)))).sort().reverse();
+  openModal({
+    title: 'Export CSV',
+    body: '<div class="row2 s1"><div class="field"><label>What</label><select id="xk"><option value="owned"' + (sold ? '' : ' selected') + '>Owned holdings (today)</option><option value="sold"' + (sold ? ' selected' : '') + '>Sold history</option></select></div>' +
+      '<div class="field"><label>Account</label><select id="xa">' + accountOptions(sold ? ui.sold.account : ui.owned.account, 'All accounts') + '</select></div></div>' +
+      '<div class="field" id="xlw"><label>Detail</label><select id="xl"><option value="positions">One row per position (average price)</option><option value="lots">One row per lot (each purchase)</option></select></div>' +
+      '<div class="row2 s1"><div class="field" id="xyw"><label>Year of sale</label><select id="xy"><option value="">All years</option>' + years.map(y => '<option' + (y === ui.sold.year ? ' selected' : '') + '>' + y + '</option>').join('') + '</select></div>' +
+      '<div class="field"><label>Format</label><select id="xp"><option value="eu">Excel (Hungarian/European): ; and decimal comma</option><option value="std">Standard: , and decimal point</option></select></div></div>' +
+      '<div id="xout" class="hidden"><div class="resolve" id="xinfo"></div><div style="display:flex;gap:8px;margin-bottom:8px"><a class="btn primary" id="xdl" download>Download .csv</a><button class="btn" type="button" id="xcp">Copy to clipboard</button></div>' +
+      '<textarea id="xta" rows="6" style="width:100%;font:12px monospace" readonly></textarea></div>',
+    submit: 'Create CSV', cancelLabel: 'Close',
+    onOpen: m => { const sync = () => { $('#xyw', m).classList.toggle('hidden', $('#xk', m).value !== 'sold'); $('#xlw', m).classList.toggle('hidden', $('#xk', m).value === 'sold'); }; $('#xk', m).addEventListener('input', sync); sync(); },
+    onSubmit: async m => {
+      const res = await call('exportCsv', $('#xk', m).value, $('#xa', m).value, $('#xk', m).value === 'sold' ? $('#xy', m).value : '', $('#xp', m).value, $('#xl', m).value);
+      if (!res.success) { setErr(m, res.message); return false; }
+      setErr(m, '');
+      $('#xout', m).classList.remove('hidden');
+      $('#xinfo', m).textContent = res.data.filename + ' (' + res.data.rows + ' rows)';
+      $('#xta', m).value = res.data.csv;
+      try { const blob = new Blob([res.data.csv], { type: 'text/csv;charset=utf-8' }); $('#xdl', m).href = URL.createObjectURL(blob); $('#xdl', m).download = res.data.filename; } catch (e) { /* the text box below still works */ }
+      $('#xcp', m).onclick = () => { $('#xta', m).select(); try { document.execCommand('copy'); toast('Copied'); } catch (e) { toast('Press Ctrl+C to copy', 'warn'); } };
+      return false;
+    }
+  });
+}
+
+// ------------------------------------------------------------------ ACCOUNTS tab
+const accA = r => ' data-a="' + esc(r.name) + '"';
+const accountCols = [
+  { key: 'name', label: 'Account', html: r => '<b>' + esc(r.name) + '</b>' },
+  { key: 'holdings', label: 'Holdings', num: true, html: r => String(r.holdings) },
+  { key: 'sold', label: 'Sold', num: true, html: r => String(r.sold) },
+  { key: 'invested', label: 'Invested (EUR)', num: true, html: r => isNum(r.investedEur) ? money(r.investedEur) : '<span class="na" title="No FX rate for one of the holdings">N/A</span>' },
+  { key: 'value', label: 'Value (EUR)', num: true, html: r => isNum(r.valueEur) ? money(r.valueEur) : '<span class="na" title="' + r.missing + ' holding(s) without a price or FX rate">N/A</span>' },
+  { key: 'realized', label: 'Realized (EUR)', num: true, cls: r => plCls(r.realizedEur), html: r => signed(r.realizedEur) },
+  { key: 'cash', label: 'Available cash', num: true, html: r => r.cash === null ? '<button class="btn sm" data-act="setCash"' + accA(r) + '>Set cash...</button>' :
+      '<b title="Updated ' + esc(r.cashUpdated) + '">' + money(r.cash) + '</b><span class="sub">' + esc(r.cashCcy) + '</span><button class="icon" data-act="setCash"' + accA(r) + ' title="Set to the amount on your statement">&#9998;</button>' },
+  { key: 'cashEur', label: 'Cash (EUR)', num: true, html: r => r.cash === null ? NA : (isNum(r.cashEur) ? money(r.cashEur) : '<span class="na" title="No FX rate for ' + esc(r.cashCcy) + '">N/A</span>') },
+  { key: 'total', label: 'Total (EUR)', num: true, html: r => isNum(r.totalEur) ? '<b>' + money(r.totalEur) + '</b>' : NA },
+  { label: '', html: r => '<button class="btn sm" data-act="renameAcc"' + accA(r) + '>Rename</button> ' + (r.cash !== null ? '<button class="btn sm" data-act="adjCash"' + accA(r) + ' title="Deposit, withdrawal, fee, dividend">Adjust</button> <button class="btn sm" data-act="cashLog"' + accA(r) + '>History</button> ' : '') +
+      '<button class="btn sm" data-act="delAcc"' + accA(r) + (r.holdings || r.sold || (r.cash !== null && r.cash !== 0) ? ' disabled title="Still in use"' : '') + '>Delete</button>' }
+];
+function renderAccounts() {
+  const rows = state.accounts.accounts;
+  const sum = f => rows.every(r => isNum(f(r))) ? rows.reduce((a, r) => a + f(r), 0) : null;
+  const value = sum(r => r.valueEur), cash = sum(r => r.cash === null ? 0 : r.cashEur), grand = (value !== null && cash !== null) ? value + cash : null;
+  const card = (l, v) => '<div class="card"><div class="lbl">' + l + '</div><div class="val">' + (isNum(v) ? nf(v, 2) : 'N/A') + '</div></div>';
+  const intro = 'Accounts group your holdings and sales. <b>Available cash</b>: enter an account\'s cash once, as your statement shows it today; from then on buying and selling in the app adjusts it, and <b>Adjust</b> covers deposits, withdrawals, fees and dividends. Typing a new account name when you add a holding creates the account automatically.';
+  root('accounts').innerHTML = (PHONE ? '<details class="hintbox"><summary class="muted">How accounts and cash work</summary><p class="muted">' + intro + '</p></details>' : '<p class="muted" style="margin-top:0">' + intro + '</p>') +
+    '<div class="cards">' + card('Holdings value (EUR)', value) + card('Available cash (EUR)', cash) + card('Total (EUR)', grand) + '</div>' +
+    '<div class="toolbar keep"><span class="grow"></span><button class="btn hide-ph" data-act="cols" title="Show, hide and resize columns">Columns</button><button class="btn hide-ph" data-act="reload">&#8635;</button><button class="btn primary" data-act="addAcc">+ Add account</button></div>' +
+    '<div class="table-wrap" id="tbl"></div>';
+  fillAccounts();
+}
+function fillAccounts() {
+  const rows = state.accounts.accounts;
+  $('#tbl', root('accounts')).innerHTML = PHONE ? cardList(rows, accountCard, 'No accounts yet. Tap + Add account.') : tableHtml('accounts', accountCols, rows);
+}
+const CCY_LIST = ['EUR', 'HUF', 'USD', 'GBP', 'CHF', 'CAD', 'SEK', 'DKK', 'PLN', 'CZK', 'JPY'];
+function openSetCash(name) {
+  const a = state.accounts.accounts.find(x => x.name === name);
+  if (!a) return;
+  openModal({
+    title: 'Available cash: ' + name,
+    body: '<p class="muted">Enter the cash this account has <b>today</b>, as your statement shows it. After that, buying and selling in the app adjusts it automatically (you can untick this on each purchase or sale). Use <b>Adjust</b> for deposits, withdrawals, fees and dividends, or come back here to set it again.</p>' +
+      '<div class="row2"><div class="field"><label>Available cash</label><input id="ca" type="number" step="any" value="' + (a.cash === null ? '' : a.cash) + '"></div>' +
+      '<div class="field"><label>Currency</label><input id="cc" list="cclist" maxlength="3" value="' + esc(a.cashCcy || 'EUR') + '" style="text-transform:uppercase"><datalist id="cclist">' + CCY_LIST.map(x => '<option value="' + x + '">').join('') + '</datalist></div></div>' +
+      '<div class="field"><label>Note (optional)</label><input id="cn" placeholder="e.g. balance from the March statement"></div>' + (a.cash !== null ? '<button class="btn" type="button" data-m2="stop">Stop tracking cash</button>' : ''),
+    submit: 'Save',
+    onOpen: m => {
+      $('#ca', m).focus();
+      m.addEventListener('click', async e => {
+        if (!e.target.closest('[data-m2=stop]')) return;
+        if (await confirmModal('Stop tracking cash?', 'The balance of <b>' + esc(name) + '</b> is cleared. The history stays in the CashLog sheet.', 'Stop tracking', true)) mutate(call('clearAccountCash', name));
+      });
+    },
+    onSubmit: async m => {
+      const r = await call('setAccountCash', name, $('#ca', m).value, $('#cc', m).value.trim().toUpperCase(), $('#cn', m).value.trim());
+      if (r.success) { toast(r.message); invalidate(); return true; }
+      setErr(m, r.message); return false;
+    }
+  });
+}
+function openAdjustCash(name) {
+  const a = state.accounts.accounts.find(x => x.name === name);
+  if (!a) return;
+  openModal({
+    title: 'Adjust cash: ' + name,
+    body: '<p class="muted">Now <b>' + nf(a.cash, 2) + ' ' + esc(a.cashCcy) + '</b>. Enter the amount to add (positive: deposit, dividend) or take out (negative: withdrawal, fee).</p>' +
+      '<div class="field"><label>Amount (' + esc(a.cashCcy) + ')</label><input id="ca" type="number" step="any" placeholder="e.g. 500 or -12.5"></div><div class="field"><label>Note (optional)</label><input id="cn" placeholder="deposit, fee, dividend..."></div>',
+    submit: 'Apply', onOpen: m => $('#ca', m).focus(),
+    onSubmit: async m => {
+      const r = await call('adjustAccountCash', name, $('#ca', m).value, $('#cn', m).value.trim());
+      if (r.success) { toast(r.message); invalidate(); return true; }
+      setErr(m, r.message); return false;
+    }
+  });
+}
+async function openCashLog(name) {
+  const r = await call('getCashLog', name);
+  if (!r.success) return toast(r.message, 'error');
+  const cols = [{ label: 'When', html: x => esc(x.time) }, { label: 'Change', num: true, cls: x => plCls(x.change), html: x => signed(x.change) + ' ' + esc(x.ccy) },
+    { label: 'Balance', num: true, html: x => money(x.balance) + ' ' + esc(x.ccy) }, { label: 'Reason', html: x => esc(x.reason) }, { label: 'Details', html: x => '<span style="white-space:normal">' + esc(x.details) + '</span>' }];
+  const card = x => '<div class="pc"><div class="pc-log"><div class="pc-r"><b class="' + plCls(x.change) + '">' + signed(x.change) + ' ' + esc(x.ccy) + '</b><span class="pc-m">' + esc(x.time) + '</span></div><div class="pc-r"><span class="pc-m">' + esc(x.reason) + '</span><span class="pc-m">balance ' + money(x.balance) + ' ' + esc(x.ccy) + '</span></div>' + (x.details ? '<div class="pc-m" style="margin-top:3px">' + esc(x.details) + '</div>' : '') + '</div></div>';
+  openModal({ title: 'Cash history: ' + name, wide: true, cancelLabel: 'Close', body: PHONE ? cardList(r.data.rows, card, 'No cash movements yet.') : '<div class="table-wrap" style="max-height:60vh">' + tableHtml('cashlog', cols, r.data.rows) + '</div>' });
+}
+
+// ------------------------------------------------------------------ COLUMNS menu + resize
+function openColumns(tab) {
+  const cols = ({ owned: ownedCols, watch: watchCols, sold: soldCols, log: logCols, accounts: accountCols })[tab], pf = tp(tab);
+  const list = cols.map((c, i) => ({ c, i, k: colKey(c, i) })).filter(m => m.i > 0 && m.c.label !== '');
+  openModal({
+    title: 'Columns', cancelLabel: 'Close',
+    body: '<p class="muted">Tick the columns you want to see. To resize a column, drag the edge of its header (double-click the edge to fit the content). The first column and the buttons stay. Your choices are saved.</p><div class="colmenu">' +
+      list.map(m => '<label><input type="checkbox" data-k="' + m.k + '"' + (pf.hidden.indexOf(m.k) < 0 ? ' checked' : '') + '> ' + esc(m.c.label) + '</label>').join('') + '</div>' +
+      '<div style="margin-top:12px;display:flex;gap:8px"><button class="btn" type="button" data-m2="all">Show all columns</button><button class="btn" type="button" data-m2="widths">Reset column widths</button></div>',
+    onOpen: m => {
+      m.addEventListener('change', e => {
+        const cb = e.target.closest('input[data-k]');
+        if (!cb) return;
+        pf.hidden = pf.hidden.filter(k => k !== cb.dataset.k).concat(cb.checked ? [] : [cb.dataset.k]);
+        savePrefs(); render(tab);
+      });
+      m.addEventListener('click', e => {
+        const b = e.target.closest('[data-m2]');
+        if (!b) return;
+        if (b.dataset.m2 === 'widths') pf.widths = {}; else { pf.hidden = []; $$('input[data-k]', m).forEach(i => { i.checked = true; }); }
+        savePrefs(); render(tab);
+      });
+    }
+  });
+}
+function colWidthsSum(table) { return $$('col', table).reduce((a, x) => a + (parseInt(x.style.width, 10) || 0), 0); }
+document.addEventListener('mousedown', e => {
+  const rz = e.target.closest && e.target.closest('.rz');
+  if (!rz) return;
+  e.preventDefault(); e.stopPropagation();
+  const th = rz.parentElement, table = th.closest('table'), col = $('col[data-k="' + rz.dataset.k + '"]', table), tab = state.tab, key = rz.dataset.k;
+  const x0 = e.clientX, w0 = th.getBoundingClientRect().width;
+  rz.classList.add('drag'); document.body.style.cursor = 'col-resize'; document.body.style.userSelect = 'none';
+  const move = ev => { col.style.width = Math.max(40, Math.min(1200, Math.round(w0 + ev.clientX - x0))) + 'px'; table.style.width = 'max(100%,' + colWidthsSum(table) + 'px)'; };
+  const up = () => {
+    document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up);
+    rz.classList.remove('drag'); document.body.style.cursor = ''; document.body.style.userSelect = '';
+    tp(tab).widths[key] = parseInt(col.style.width, 10); lastResize = Date.now(); savePrefs();
+  };
+  document.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
+}, true);
+document.addEventListener('dblclick', e => {                    // double-click the edge: fit the column to its content
+  const rz = e.target.closest && e.target.closest('.rz');
+  if (!rz) return;
+  const th = rz.parentElement, table = th.closest('table'), idx = Array.prototype.indexOf.call(th.parentElement.children, th), col = $('col[data-k="' + rz.dataset.k + '"]', table);
+  let w = th.scrollWidth;
+  $$('tbody > tr', table).forEach(tr => { const td = tr.children[idx]; if (td && !tr.classList.contains('lotrow')) w = Math.max(w, td.scrollWidth); });
+  w = Math.max(40, Math.min(1200, Math.ceil(w) + 22));
+  col.style.width = w + 'px'; table.style.width = 'max(100%,' + colWidthsSum(table) + 'px)';
+  tp(state.tab).widths[rz.dataset.k] = w; lastResize = Date.now(); savePrefs();
+});
+
+function openAccountName(title, cur, fn) {
+  openModal({ title, body: '<div class="field"><label>Account name (max 40 characters)</label><input id="an" value="' + esc(cur) + '" maxlength="40"></div>', submit: 'Save',
+    onOpen: m => { $('#an', m).focus(); $('#an', m).select(); },
+    onSubmit: async m => { const r = await fn($('#an', m).value); if (r.success) { toast(r.message); invalidate(); return true; } setErr(m, r.message); return false; } });
+}
+
+// ------------------------------------------------------------------ HISTORY tab (daily value snapshots)
+function renderHistory() {
+  const d = state.history, u = ui.history, el = root('history');
+  const all = d.rows.filter(r => r.account === (u.account || 'ALL'));
+  const days = Number(u.range || 0), last = all.length ? Date.parse(all[all.length - 1].date + 'T00:00:00') : 0;
+  const rows = days ? all.filter(r => Date.parse(r.date + 'T00:00:00') >= last - days * 86400000) : all;
+  const good = rows.filter(r => r.missing === 0);
+  let chart = '<div class="loading">No snapshots yet. The first one is recorded tonight at 23:00, or click <b>Record snapshot now</b>.</div>', stat = '';
+  if (good.length) {
+    const W = PHONE ? 370 : 900, H = PHONE ? 240 : 300, L = PHONE ? 46 : 70, R = PHONE ? 12 : 20, T = 16, B = 34;
+    const axisNum = v => PHONE && Math.abs(v) >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : PHONE && Math.abs(v) >= 1e4 ? Math.round(v / 1e3) + 'k' : Math.round(v).toLocaleString();
+    const xs = good.map(r => Date.parse(r.date + 'T00:00:00')), ys = good.map(r => r.valueEur);
+    const x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+    let y0 = Math.min.apply(null, ys), y1 = Math.max.apply(null, ys);
+    if (y0 === y1) { y0 -= 1; y1 += 1; } const pad = (y1 - y0) * 0.1; y0 -= pad; y1 += pad;
+    const X = v => L + (x1 === x0 ? (W - L - R) / 2 : (v - x0) / (x1 - x0) * (W - L - R)), Y = v => T + (1 - (v - y0) / (y1 - y0)) * (H - T - B);
+    let path = '', prevDate = null;
+    good.forEach((r, i) => {
+      const t = xs[i], gap = prevDate !== null && rows.some(q => q.missing > 0 && Date.parse(q.date + 'T00:00:00') > prevDate && Date.parse(q.date + 'T00:00:00') < t);
+      path += (prevDate === null || gap ? 'M' : 'L') + X(t).toFixed(1) + ' ' + Y(r.valueEur).toFixed(1) + ' '; prevDate = t;
+    });
+    let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" class="chart" role="img" aria-label="Portfolio value over time">';
+    for (let i = 0; i <= 4; i++) { const v = y0 + (y1 - y0) * i / 4, yy = Y(v); svg += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + yy + '" y2="' + yy + '" class="grid"/><text x="' + (L - 8) + '" y="' + (yy + 4) + '" class="axis" text-anchor="end">' + axisNum(v) + '</text>'; }
+    svg += '<text x="' + L + '" y="' + (H - 10) + '" class="axis">' + esc(good[0].date) + '</text><text x="' + (W - R) + '" y="' + (H - 10) + '" class="axis" text-anchor="end">' + esc(good[good.length - 1].date) + '</text>';
+    svg += '<path d="' + path + '" class="line"/>';
+    good.forEach((r, i) => { svg += '<circle cx="' + X(xs[i]).toFixed(1) + '" cy="' + Y(r.valueEur).toFixed(1) + '" r="' + (PHONE && good.length > 45 ? 1.8 : 3) + '" class="dot"><title>' + esc(r.date) + ': ' + Math.round(r.valueEur).toLocaleString() + ' EUR (' + r.positions + ' positions)</title></circle>'; });
+    chart = '<div class="table-wrap" style="padding:8px">' + svg + '</svg></div>';
+    const a = good[0], b = good[good.length - 1], dv = b.valueEur - a.valueEur;
+    stat = '<div class="cards"><div class="card"><div class="lbl">Latest value (EUR)</div><div class="val">' + nf(b.valueEur, 0) + '</div></div>' +
+      '<div class="card"><div class="lbl">Change since ' + esc(a.date) + '</div><div class="val ' + plCls(dv) + '">' + signed(dv) + '</div></div></div>' +
+      '<p class="muted small">Value, not performance: buying and selling also move this line. Days with a missing price or FX rate are left out rather than guessed.</p>';
+  }
+  const tbl = [
+    { label: 'Date', html: r => esc(r.date) }, { label: 'Value (EUR)', num: true, html: r => money(r.valueEur) },
+    { label: 'Unrealised P/L (EUR)', num: true, cls: r => plCls(r.plEur), html: r => signed(r.plEur) }, { label: 'Positions', num: true, html: r => String(r.positions) },
+    { label: 'Missing', num: true, html: r => r.missing ? '<span class="neg">' + r.missing + '</span>' : '0' }
+  ];
+  el.innerHTML = '<div class="toolbar keep inline"><span class="tbf"><select id="f-haccount">' + [['ALL', 'All accounts']].concat(d.accounts.map(a => [a, a])).map(o => '<option value="' + esc(o[0]) + '"' + (o[0] === u.account ? ' selected' : '') + '>' + esc(o[1]) + '</option>').join('') + '</select>' +
+    selectHtml('f-hrange', [['30', 'Last 30 days'], ['90', 'Last 90 days'], ['365', 'Last year'], ['0', 'Everything']], u.range) +
+    '</span><span class="grow"></span><button class="btn hide-ph" data-act="reload">&#8635;</button><button class="btn" data-act="recordHistory">Record snapshot now</button></div>' + stat + chart +
+    '<h3 style="margin:16px 0 8px">Snapshots</h3><div class="table-wrap">' + tableHtml('history', tbl, rows.slice().reverse().slice(0, 60)) + '</div>';
+}
+
+// ------------------------------------------------------------------ IMPORT wizard (paste -> map columns -> preview/edit -> import row by row)
+const IMP_TARGETS = [['', '(ignore)'], ['name', 'Name'], ['ticker', 'Ticker'], ['qty', 'Quantity'], ['price', 'Buy price'], ['date', 'Buy date'], ['currency', 'Currency'],
+  ['account', 'Account'], ['broker', 'Broker (only for selecting rows)'], ['action', 'Action (Owned / Watchlist / Skip)']];
+
+function parseDelimited(text) {
+  text = String(text || '').replace(/\r\n?/g, '\n').replace(/^\uFEFF/, '');
+  const first = text.split('\n').find(l => l.trim()) || '';
+  const delim = first.includes('\t') ? '\t' : (first.split(';').length > first.split(',').length ? ';' : ',');
+  const rows = []; let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) { if (ch === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += ch; }
+    else if (ch === '"' && cell === '') q = true;
+    else if (ch === delim) { row.push(cell); cell = ''; }
+    else if (ch === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; }
+    else cell += ch;
+  }
+  row.push(cell); rows.push(row);
+  return { delim, rows: rows.filter(r => r.some(x => x.trim() !== '')).map(r => r.map(x => x.trim())) };
+}
+function numClean(v) { return String(v == null ? '' : v).replace(/[\s\u00a0\u202f]/g, '').replace(/[^\d.,\-+]/g, ''); }
+function detectNumFmt(cells) {
+  let comma = 0, point = 0;
+  cells.forEach(v => {
+    const s = numClean(v).replace(/[-+]/g, ''), hc = s.includes(','), hp = s.includes('.');
+    if (hc && hp) { if (s.lastIndexOf(',') > s.lastIndexOf('.')) comma++; else point++; }
+    else if (hc && s.split(',').length === 2 && s.length - s.lastIndexOf(',') - 1 !== 3) comma++;
+    else if (hp && s.split('.').length === 2 && s.length - s.lastIndexOf('.') - 1 !== 3) point++;
+  });
+  return comma > point ? 'comma' : 'point';
+}
+function parseNum(v, fmt) {
+  if (typeof v === 'number') return isFinite(v) ? v : NaN;
+  let s = numClean(v);
+  if (!/\d/.test(s)) return NaN;
+  const neg = /^-/.test(s); s = s.replace(/[-+]/g, '');
+  const nc = (s.match(/,/g) || []).length, nd = (s.match(/\./g) || []).length;
+  let t = s;
+  if (nc && nd) t = s.lastIndexOf(',') > s.lastIndexOf('.') ? s.replace(/\./g, '').replace(',', '.') : s.replace(/,/g, '');
+  else if (nc) t = (nc > 1 || (s.length - s.lastIndexOf(',') - 1 === 3 && fmt !== 'comma')) ? s.replace(/,/g, '') : s.replace(',', '.');
+  else if (nd) t = (nd > 1 || (s.length - s.lastIndexOf('.') - 1 === 3 && fmt === 'comma')) ? s.replace(/\./g, '') : s;
+  const n = Number(t);
+  return isFinite(n) ? (neg ? -n : n) : NaN;
+}
+/** '' = blank, null = unreadable, else YYYY-MM-DD. Accepts 2025-03-12, 2025.03.12., 2025. 03. 12., 12.03.2025, 12/03/2025 (day first unless the second number is above 12). */
+function parseDate(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!s) return '';
+  let y, mo, d, m = /^(\d{4})[-./\s]+(\d{1,2})[-./\s]+(\d{1,2})\.?$/.exec(s);
+  if (m) { y = +m[1]; mo = +m[2]; d = +m[3]; }
+  else if ((m = /^(\d{1,2})[-./\s]+(\d{1,2})[-./\s]+(\d{4})\.?$/.exec(s))) { y = +m[3]; const a = +m[1], b = +m[2]; if (b > 12 && a <= 12) { mo = a; d = b; } else { d = a; mo = b; } }
+  else return null;
+  const dt = new Date(y, mo - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
+  return y + '-' + String(mo).padStart(2, '0') + '-' + String(d).padStart(2, '0');
+}
+function parseAction(v) {
+  const s = String(v || '').trim().toLowerCase();
+  return /^(o|own|owned|held)$/.test(s) ? 'owned' : /^(w|watch|watchlist)$/.test(s) ? 'watch' : /^(s|skip|ignore|-|x)$/.test(s) ? 'skip' : '';
+}
+function guessMapping(header, data) {
+  const map = header.map(() => ''), lo = header.map(h => String(h || '').toLowerCase().trim());
+  const col = i => data.slice(0, 60).map(r => (r[i] == null ? '' : String(r[i]).trim())).filter(Boolean);
+  const free = t => map.indexOf(t) < 0;
+  lo.forEach((h, i) => {
+    let t = '';
+    if (/^(ticker|symbol|sym)$/.test(h)) t = 'ticker';
+    else if (/^(qty|quantity|shares|units|pieces)$/.test(h)) t = 'qty';
+    else if (/^(buy|buy price|cost|avg|avg price|average price|bought|purchase price|price paid)$/.test(h)) t = 'price';
+    else if (/date/.test(h)) t = 'date';
+    else if (/^(cur|ccy|currency)$/.test(h)) t = 'currency';
+    else if (/^(account|acct|portfolio)$/.test(h)) t = 'account';
+    else if (/^brok/.test(h)) t = 'broker';
+    else if (/^(action|type)$/.test(h) && col(i).some(x => parseAction(x))) t = 'action';
+    else if (h === 'name') t = 'name';
+    if (t && free(t)) map[i] = t;
+  });
+  const loose = lo.map((h, i) => (/^(asset|instrument|security|description|company|stock|holding)/.test(h) && !map[i]) ? i : -1).filter(i => i >= 0);
+  const tickerLike = i => { const v = col(i); return v.length ? v.filter(x => /^\$?[A-Za-z0-9.\-:]{1,16}$/.test(x)).length / v.length : 0; };
+  if (free('ticker') && loose.length) {
+    const best = loose.slice().sort((a, b) => tickerLike(b) - tickerLike(a))[0];
+    if (tickerLike(best) > 0.6) { map[best] = 'ticker'; loose.splice(loose.indexOf(best), 1); }
+  }
+  if (free('name') && loose.length) map[loose[0]] = 'name';
+  if (free('qty')) {                                               // a vaguely named size column: the one with the bigger typical values
+    const mean = i => { const v = col(i).map(x => parseNum(x, 'point')).filter(x => isFinite(x)); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : -1; };
+    const w = lo.map((h, i) => (/^(weight|amount|pos)/.test(h) && !map[i]) ? i : -1).filter(i => i >= 0).sort((a, b) => mean(b) - mean(a));
+    if (w.length) map[w[0]] = 'qty';
+  }
+  return map;
+}
+window.__imp = { parseDelimited, parseNum, parseDate, detectNumFmt, guessMapping, parseAction };
+
+function openImport() {
+  const imp = { header: [], data: [], map: [], rows: [], numFmt: 'auto', fmt: 'point', defDate: today(), defAcc: lastAccount(), mode: 'skip', ignored: 0, onlineWarn: false, running: false, deduct: false, newAccounts: [], timer: null };
+  const m = openModal({ title: 'Import holdings', wide: true, cancelLabel: 'Close', body: '<div id="imp"></div>' });
+  const box = $('#imp', m), alive = () => modalEl === m;
+
+  function step1(msg) {
+    box.innerHTML = '<p class="muted">Copy the cells from Excel or Google Sheets <b>including the header row</b> and paste them here. Your own layout is fine: the next step lets you say which column is which. Rows with a buy price and quantity become holdings, the others become Watchlist candidates, and you can change any row before anything is written.</p>' +
+      '<textarea id="ipaste" rows="9" style="width:100%;font:12px monospace" placeholder="Ticker\tQuantity\tBuy price\tCurrency\tAccount ..."></textarea>' +
+      '<div class="row2" style="margin-top:10px"><div class="field"><label>Numbers use</label><select id="infmt"><option value="auto">Auto-detect</option><option value="point">Decimal point (1,234.56)</option><option value="comma">Decimal comma (1 234,56)</option></select></div>' +
+      '<div class="field"><label>Buy date for rows without one</label><input id="idef" type="date" value="' + esc(imp.defDate) + '" max="' + today() + '"></div></div>' +
+      '<div class="field"><label>Account for rows without one (optional)</label><input id="idacc" list="accl" autocomplete="off" value="' + esc(imp.defAcc) + '"></div>' +
+      '<div class="err" id="ierr">' + esc(msg || '') + '</div><div style="text-align:right"><button class="btn primary" id="iread">Read data</button></div>';
+    $('#iread', box).onclick = () => {
+      const p = parseDelimited($('#ipaste', box).value);
+      if (p.rows.length < 2) { $('#ierr', box).textContent = 'Paste at least a header row and one data row.'; return; }
+      imp.numFmt = $('#infmt', box).value; imp.defDate = $('#idef', box).value || today(); imp.defAcc = $('#idacc', box).value.trim();
+      imp.header = p.rows[0]; imp.data = p.rows.slice(1);
+      const w = Math.max.apply(null, p.rows.map(r => r.length));
+      while (imp.header.length < w) imp.header.push('');
+      imp.map = guessMapping(imp.header, imp.data);
+      step2();
+    };
+  }
+
+  function step2(msg) {
+    const sample = i => imp.data.slice(0, 3).map(r => r[i]).filter(x => x).join('  |  ');
+    box.innerHTML = '<p>Tell the app what each column holds. Unlisted columns are ignored. A <b>Ticker</b> column is required; without Quantity and Buy price a row becomes a Watchlist candidate.</p>' +
+      '<div class="table-wrap" style="max-height:48vh"><table class="imp"><thead><tr><th>Column</th><th>First values</th><th>Holds</th></tr></thead><tbody>' +
+      imp.header.map((h, i) => '<tr><td><b>' + esc(h || 'Column ' + (i + 1)) + '</b></td><td class="muted">' + esc(sample(i)) + '</td><td><select class="imap" data-i="' + i + '">' +
+        IMP_TARGETS.map(t => '<option value="' + t[0] + '"' + (imp.map[i] === t[0] ? ' selected' : '') + '>' + t[1] + '</option>').join('') + '</select></td></tr>').join('') + '</tbody></table></div>' +
+      '<div class="err" id="ierr">' + esc(msg || '') + '</div><div style="display:flex;justify-content:space-between;margin-top:10px"><button class="btn" id="iback">Back</button><button class="btn primary" id="inext">Continue</button></div>';
+    box.onchange = e => {
+      const s = e.target.closest('.imap');
+      if (!s) return;
+      imp.map[+s.dataset.i] = s.value;
+      if (s.value) $$('.imap', box).forEach(o => { if (o !== s && o.value === s.value) { o.value = ''; imp.map[+o.dataset.i] = ''; } });   // each meaning once
+    };
+    $('#iback', box).onclick = () => step1();
+    $('#inext', box).onclick = () => { if (imp.map.indexOf('ticker') < 0) return step2('Choose which column holds the Ticker.'); box.onchange = null; step3(); };
+  }
+
+  function buildRows() {
+    const gi = t => imp.map.indexOf(t), g = (r, t) => { const i = gi(t); return i < 0 || r[i] == null ? '' : String(r[i]).trim(); };
+    const numCells = []; ['qty', 'price'].forEach(t => imp.data.forEach(r => numCells.push(g(r, t))));
+    imp.fmt = imp.numFmt === 'auto' ? detectNumFmt(numCells) : imp.numFmt; imp.ignored = 0;
+    const out = [];
+    imp.data.forEach(r => {
+      if (r.filter(x => x !== '').length <= 1) { imp.ignored++; return; }               // section titles, TOTAL, blank-ish lines
+      const ticker = g(r, 'ticker').toUpperCase().replace(/^\$/, '').replace(/\s+/g, ''), price = parseNum(g(r, 'price'), imp.fmt), qty = parseNum(g(r, 'qty'), imp.fmt);
+      const dRaw = g(r, 'date'), d = parseDate(dRaw);
+      let action = parseAction(g(r, 'action')), note = '';
+      if (!ticker) { action = 'skip'; note = 'No ticker'; }
+      else if (!action) action = (price > 0 && qty > 0) ? 'owned' : 'watch';
+      out.push({ action, note, account: g(r, 'account') || imp.defAcc, ticker, symbol: ticker, candidates: [], date: d === null ? '' : d, dateRaw: dRaw, dateErr: d === null,
+        price: isFinite(price) ? price : null, qty: isFinite(qty) ? qty : null, name: g(r, 'name'), currency: g(r, 'currency'), broker: g(r, 'broker'), sel: false, state: '', message: '', done: false });
+    });
+    return out;
+  }
+
+  async function step3() {
+    box.innerHTML = '<div class="loading"><span class="spin"></span><span id="iprog">Reading rows...</span></div>';
+    imp.rows = buildRows();
+    const plain = {};
+    imp.rows.forEach(r => { if (r.action !== 'skip' && r.ticker && r.ticker.indexOf(':') < 0) (plain[r.ticker] = plain[r.ticker] || []).push(r); });
+    const syms = Object.keys(plain); let k = 0; imp.onlineWarn = false;
+    for (const s of syms) {
+      const pr = $('#iprog', box); if (pr) pr.textContent = 'Finding listings ' + (++k) + '/' + syms.length + ' (' + s + ')...';
+      const res = await call('suggestListings', s, plain[s][0].currency);
+      if (!alive()) return;
+      plain[s].forEach(r => { if (res.success) { r.candidates = res.data.candidates; if (res.data.pick) r.ticker = res.data.pick; } });
+      if (res.success && !res.data.onlineOk) imp.onlineWarn = true;
+    }
+    await revalidate();
+    if (alive()) drawPreview();
+  }
+
+  async function revalidate() {
+    const payload = imp.rows.map(r => ({ action: r.action, account: r.account, ticker: r.ticker, date: r.date, price: r.price, qty: r.qty, currency: r.currency, name: r.name }));
+    const res = await call('previewImport', payload, { defaultDate: imp.defDate });
+    if (!alive()) return;
+    if (!res.success) { toast(res.message, 'error'); return; }
+    imp.newAccounts = res.data.newAccounts;
+    imp.rows.forEach((r, i) => {
+      if (r.done || r.failed) return;                                   // a refused row keeps its reason until the user edits it
+      const s = res.data.rows[i];
+      r.state = s.state; r.message = s.message;
+      if (r.action !== 'skip' && r.dateErr) { r.state = 'error'; r.message = 'Unreadable date "' + r.dateRaw + '".'; }
+      else if (r.state === 'error' && r.action !== 'skip' && r.ticker.indexOf(':') < 0) r.message = r.candidates.length ? 'Pick the listing (exchange) for ' + r.ticker + '.' : 'No listing found for ' + r.ticker + ': type EXCHANGE:SYMBOL.';
+      if (r.action === 'skip') { r.state = 'skip'; r.message = r.note || ''; }
+    });
+  }
+  const todo = r => r.action !== 'skip' && !r.done && (r.failed || r.state === 'new' || r.state === 'move' || r.state === 'dup' || (r.state === 'exists' && imp.mode !== 'skip'));
+  const modeOf = r => (r.state === 'exists' && imp.mode === 'replace') ? 'replace' : 'add';
+
+  function statusHtml(r) {
+    if (r.done) return '<span class="pos">Imported &#10003;</span> <span class="muted">' + esc(r.message) + '</span>';
+    if (r.state === 'importing') return '<span class="spin"></span>importing...';
+    if (r.state === 'failed') return '<span class="neg">' + esc(r.message) + '</span>';
+    if (r.state === 'error') return '<span class="neg">' + esc(r.message) + '</span>';
+    if (r.state === 'skip') return '<span class="muted">Skipped' + (r.message ? ': ' + esc(r.message) : '') + '</span>';
+    if (r.state === 'skipw') return '<span class="muted">' + esc(r.message) + '</span>';
+    if (r.state === 'exists') return imp.mode === 'skip' ? '<span class="muted">Already held: skipped</span>' : '<span class="neg">Already held: will ' + (imp.mode === 'replace' ? 'be replaced' : 'be added as a new lot') + '</span>';
+    if (r.state === 'move' || r.state === 'dup') return '<span class="muted">' + esc(r.message) + '</span>';
+    return '<span class="pos">Ready</span> <span class="muted">' + esc(r.message) + '</span>';
+  }
+  function paint() {
+    imp.rows.forEach((r, i) => { const el = $('#ist' + i, box); if (el) el.innerHTML = statusHtml(r); });
+    const n = imp.rows.filter(todo).length, own = imp.rows.filter(r => todo(r) && r.action === 'owned').length, wat = imp.rows.filter(r => todo(r) && r.action === 'watch').length;
+    const bad = imp.rows.filter(r => r.action !== 'skip' && !r.done && (r.state === 'error' || r.state === 'failed')).length, done = imp.rows.filter(r => r.done).length;
+    $('#isum', box).innerHTML = '<b>' + own + '</b> holding(s) and <b>' + wat + '</b> watchlist row(s) ready' + (bad ? ', <span class="neg"><b>' + bad + '</b> with problems (left out until fixed)</span>' : '') + (done ? ', <span class="pos"><b>' + done + '</b> imported</span>' : '') +
+      (imp.ignored ? '. <span class="muted">' + imp.ignored + ' title/blank line(s) ignored.</span>' : '') +
+      (imp.newAccounts.length ? '<br>New accounts that will be created: <b>' + esc(imp.newAccounts.join(', ')) + '</b>' : '') +
+      (imp.onlineWarn ? '<br><span class="muted">Yahoo search was unavailable for some symbols: pick listings from the dropdown or type EXCHANGE:SYMBOL.</span>' : '');
+    const go = $('#igo', box); go.disabled = imp.running || n === 0; go.textContent = imp.running ? 'Importing...' : 'Import ' + n + ' row(s)';
+  }
+  function rowHtml(r, i) {
+    const cand = r.candidates.length > 1 ? '<select class="icand" data-i="' + i + '"><option value="">pick listing...</option>' + r.candidates.map(x => '<option value="' + esc(x.ticker) + '"' + (x.ticker === r.ticker ? ' selected' : '') + '>' + esc(x.ticker) + ' - ' + esc(x.name) + (x.compat ? '' : ' (other currency)') + '</option>').join('') + '</select>' : '';
+    const fld = (f, v, cls, extra) => '<input class="ifld ' + (cls || '') + '" data-f="' + f + '" data-i="' + i + '" value="' + esc(v == null ? '' : v) + '" ' + (extra || '') + '>';
+    return '<tr><td><input type="checkbox" class="isel" data-i="' + i + '"' + (r.sel ? ' checked' : '') + '></td>' +
+      '<td><select class="ifld" data-f="action" data-i="' + i + '">' + [['owned', 'Owned'], ['watch', 'Watchlist'], ['skip', 'Skip']].map(o => '<option value="' + o[0] + '"' + (r.action === o[0] ? ' selected' : '') + '>' + o[1] + '</option>').join('') + '</select></td>' +
+      '<td>' + fld('account', r.account, '', 'list="accl" autocomplete="off" style="width:150px"') + '</td><td>' + fld('ticker', r.ticker, '', 'style="width:130px"') + cand + '</td>' +
+      '<td class="iname" title="' + esc(r.name) + '">' + esc(r.name) + '</td><td>' + fld('date', r.dateErr ? r.dateRaw : r.date, '', 'placeholder="default" style="width:96px"') + '</td>' +
+      '<td>' + fld('price', isNum(r.price) ? r.price : '', 'num', 'style="width:84px"') + '</td><td>' + fld('qty', isNum(r.qty) ? r.qty : '', 'num', 'style="width:70px"') + '</td>' +
+      '<td>' + fld('currency', r.currency, '', 'style="width:52px" title="Quote currency of the listing (GBX = pence)"') + '</td><td class="muted">' + esc(r.broker) + '</td><td class="istat" id="ist' + i + '"></td></tr>';
+  }
+  function drawPreview() {
+    const brokers = {}; imp.rows.forEach(r => { if (r.broker) brokers[r.broker] = (brokers[r.broker] || 0) + 1; });
+    box.innerHTML = '<div class="toolbar keep"><label>If a holding already exists in that account: <select id="imode"><option value="skip">Skip it</option><option value="add">Add as a new lot</option><option value="replace">Replace it (all its lots)</option></select></label>' +
+      '<label>Default buy date <input type="date" id="idef2" value="' + esc(imp.defDate) + '" max="' + today() + '"></label>' +
+      '<label title="Leave this off when you are loading holdings you already paid for"><input type="checkbox" id="idedc"' + (imp.deduct ? ' checked' : '') + '> Deduct purchases from the accounts\' available cash</label><span class="grow"></span>' +
+      '<button class="btn" id="isall">Select all</button><button class="btn" id="isnone">Select none</button>' +
+      Object.keys(brokers).map(b => '<button class="btn ichip" data-b="' + esc(b) + '">Select ' + esc(b) + ' (' + brokers[b] + ')</button>').join('') + '</div>' +
+      '<div class="toolbar keep"><b>With the selected rows:</b> Account <input id="ibacc" list="accl" autocomplete="off" style="width:190px"> <button class="btn" id="ibaccgo">Apply</button> ' +
+      '<select id="ibact"><option value="">Action...</option><option value="owned">Owned</option><option value="watch">Watchlist</option><option value="skip">Skip</option></select> <button class="btn" id="ibactgo">Apply</button></div>' +
+      '<div id="isum" class="resolve"></div><div class="table-wrap" style="max-height:46vh"><table class="imp"><thead><tr><th></th><th>Action</th><th>Account</th><th>Ticker</th><th>Name</th><th>Buy date</th><th>Buy price</th><th>Qty</th><th>Cur</th><th>Broker</th><th>Status</th></tr></thead><tbody>' +
+      imp.rows.map(rowHtml).join('') + '</tbody></table></div>' +
+      '<div id="ifail"></div><div style="display:flex;justify-content:space-between;margin-top:10px"><button class="btn" id="iback2">Back to column mapping</button><button class="btn primary" id="igo">Import</button></div>';
+    $('#imode', box).value = imp.mode;
+    paint();
+    box.onchange = box.oninput = e => {
+      const t = e.target;
+      if (t.id === 'imode') { imp.mode = t.value; paint(); return; }
+      if (t.id === 'idedc') { imp.deduct = t.checked; return; }
+      if (t.id === 'idef2') { imp.defDate = t.value || today(); queue(); return; }
+      if (t.classList.contains('isel')) { imp.rows[+t.dataset.i].sel = t.checked; return; }
+      if (t.classList.contains('icand')) { const r = imp.rows[+t.dataset.i]; if (t.value) { r.ticker = t.value; $('.ifld[data-f=ticker][data-i="' + t.dataset.i + '"]', box).value = t.value; queue(); } return; }
+      if (!t.classList.contains('ifld')) return;
+      const r = imp.rows[+t.dataset.i], f = t.dataset.f;
+      if (r.done) return;
+      r.failed = false; r.state = '';                                    // edited: re-check it
+      if (f === 'action') r.action = t.value;
+      else if (f === 'account') r.account = t.value.trim();
+      else if (f === 'ticker') r.ticker = t.value.trim().toUpperCase().replace(/^\$/, '');
+      else if (f === 'date') { const d = parseDate(t.value); r.dateRaw = t.value; r.date = d === null ? '' : d; r.dateErr = d === null; }
+      else if (f === 'currency') r.currency = t.value.trim();
+      else { const v = parseNum(t.value, imp.fmt); r[f] = isFinite(v) ? v : null; }
+      queue();
+    };
+    box.onclick = async e => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      const sel = () => imp.rows.filter(r => r.sel && !r.done);
+      if (b.id === 'isall' || b.id === 'isnone') { imp.rows.forEach(r => { r.sel = b.id === 'isall'; }); $$('.isel', box).forEach(x => { x.checked = b.id === 'isall'; }); }
+      else if (b.classList.contains('ichip')) { imp.rows.forEach((r, i) => { if (r.broker === b.dataset.b) { r.sel = true; $('.isel[data-i="' + i + '"]', box).checked = true; } }); }
+      else if (b.id === 'ibaccgo') { const a = $('#ibacc', box).value.trim(); if (a) { sel().forEach(r => { r.account = a; }); imp.rows.forEach((r, i) => { if (r.sel && !r.done) $('.ifld[data-f=account][data-i="' + i + '"]', box).value = a; }); queue(); } }
+      else if (b.id === 'ibactgo') { const a = $('#ibact', box).value; if (a) { sel().forEach(r => { r.action = a; }); imp.rows.forEach((r, i) => { if (r.sel && !r.done) $('.ifld[data-f=action][data-i="' + i + '"]', box).value = a; }); queue(); } }
+      else if (b.id === 'iback2') step2();
+      else if (b.id === 'igo') run();
+    };
+  }
+  function queue() { clearTimeout(imp.timer); imp.timer = setTimeout(async () => { await revalidate(); if (alive()) paint(); }, 350); }
+
+  async function run() {
+    clearTimeout(imp.timer); await revalidate();
+    const list = imp.rows.filter(todo);
+    if (!list.length) return paint();
+    imp.running = true; paint();
+    let okN = 0, failN = 0, k = 0;
+    for (const r of list) {
+      if (!alive()) break;
+      r.state = 'importing'; paint();
+      $('#igo', box).textContent = 'Importing ' + (++k) + '/' + list.length + '...';
+      const res = await call('importRow', { action: r.action, account: r.account, ticker: r.ticker, date: r.date, price: r.price, qty: r.qty, name: r.name, currency: r.currency }, modeOf(r), { defaultDate: imp.defDate, deductCash: imp.deduct });
+      if (res.success) { r.done = true; r.failed = false; r.state = 'done'; r.message = res.message; okN++; } else { r.failed = true; r.state = 'failed'; r.message = res.message; failN++; }
+      if (alive()) paint();
+    }
+    imp.running = false;
+    if (okN) { invalidate(); loadSymbols(); }
+    if (!alive()) return;
+    toast('Imported ' + okN + ' row(s)' + (failN ? ', ' + failN + ' failed (see the Status column)' : ''), failN ? 'warn' : '');
+    await revalidate(); if (!alive()) return; paint();
+    const failed = imp.rows.filter(r => r.state === 'failed');
+    if (failed.length) $('#ifail', box).innerHTML = '<p class="muted small">Failed rows (fix them above and click Import again, or copy them):</p><textarea rows="4" style="width:100%;font:12px monospace" readonly>' +
+      esc(failed.map(r => [r.account, r.ticker, r.date, r.price, r.qty, r.currency, r.name, r.message].join('\t')).join('\n')) + '</textarea>';
+  }
+  step1();
+}
+
+// ------------------------------------------------------------------ header / refresh
+async function loadInfo() {
+  const r = await call('getRefreshInfo');
+  if (!r.success) return;
+  state.info = r.data;
+  $('#lastUpdated').textContent = 'Last updated: ' + (r.data.lastSuccessfulRefresh || 'never');
+  $('#nextRuns').textContent = r.data.nextRuns.length ? '· next: ' + r.data.nextRuns.join(', ') : '· no hours enabled';
+}
+let cooldownTimer = null;
+function startCooldown(sec) {
+  const btn = $('#btnRefresh'), txt = $('#refreshTxt');
+  clearInterval(cooldownTimer);
+  let left = sec;
+  btn.disabled = true;
+  const tick = () => { if (left <= 0) { clearInterval(cooldownTimer); btn.disabled = false; txt.textContent = 'Refresh Now'; return; } txt.textContent = 'Wait ' + left + ' s'; left--; };
+  tick(); cooldownTimer = setInterval(tick, 1000);
+}
+async function refreshNow() {
+  const btn = $('#btnRefresh');
+  btn.disabled = true; $('#refreshSpin').classList.remove('hidden'); $('#refreshTxt').textContent = 'Refreshing...';
+  const r = await call('refreshNow');
+  $('#refreshSpin').classList.add('hidden');
+  if (r.success) { toast(r.message); invalidate(); startCooldown((state.info && state.info.cooldownSec) || 60); }
+  else if (r.data && r.data.retryAfter) { toast(r.message, 'warn'); startCooldown(r.data.retryAfter); }
+  else { toast(r.message, 'error'); btn.disabled = false; $('#refreshTxt').textContent = 'Refresh Now'; }
+}
+
+// ------------------------------------------------------------------ events
+function selectTab(name) {
+  state.tab = name;
+  $$('#tabs button[data-tab]').forEach(x => x.classList.toggle('active', x.dataset.tab === name));
+  const more = $('#tabMore'); if (more) more.classList.toggle('active', ['history', 'schedule', 'log'].indexOf(name) >= 0);
+  $$('.tab').forEach(x => x.classList.toggle('active', x.id === 'tab-' + name));
+  if (PHONE) window.scrollTo(0, 0);
+  loadTab(name, false);
+}
+function openTabMore() {                                  // History, Schedule and Log live behind the "More" tab on phones
+  const items = [['history', 'History', 'Portfolio value over time'], ['schedule', 'Schedule', 'The hours of the automatic price refresh'], ['log', 'Log', 'What the app did, and any errors']];
+  const m = openModal({ title: 'More', cancelLabel: 'Close', body: '<div class="sheetlist">' + items.map(i => '<button type="button" class="sheetbtn" data-go="' + i[0] + '"><b>' + i[1] + '</b><small>' + i[2] + '</small></button>').join('') +
+    '<button type="button" class="sheetbtn" id="mTheme"><b>Theme: ' + esc(THEME_TXT[getTheme()]) + '</b><small>Tap to change: Automatic, Light, Dark</small></button></div>' });
+  m.addEventListener('click', e => {
+    if (e.target.closest('#mTheme')) { cycleTheme(); $('#mTheme b', m).textContent = 'Theme: ' + THEME_TXT[getTheme()]; return; }
+    const b = e.target.closest('[data-go]'); if (!b) return; closeModal(); selectTab(b.dataset.go);
+  });
+}
+function openActions(tab) {                               // the toolbar buttons that do not fit on a phone, as a sheet (they keep working: we click the hidden original)
+  const src = $$('.toolbar [data-more]', root(tab));
+  if (!src.length) return;
+  const m = openModal({ title: 'Actions', cancelLabel: 'Close', body: '<div class="sheetlist">' + src.map((b, i) => '<button type="button" class="sheetbtn' + (b.classList.contains('danger') ? ' danger' : '') + '" data-i="' + i + '"><b>' + esc(b.dataset.more) + '</b>' + (b.dataset.hint ? '<small>' + esc(b.dataset.hint) + '</small>' : '') + '</button>').join('') + '</div>' });
+  m.addEventListener('click', e => { const b = e.target.closest('[data-i]'); if (!b) return; const t = src[Number(b.dataset.i)]; closeModal(); if (t) t.click(); });
+}
+$('#tabs').addEventListener('click', e => {
+  if (e.target.closest('#tabMore')) return openTabMore();
+  const b = e.target.closest('button[data-tab]');
+  if (!b) return;
+  selectTab(b.dataset.tab);
+});
+function onPhoneChange() {
+  PHONE = mq.matches; document.documentElement.classList.toggle('phone', PHONE); closeLinkMenu();
+  if (state[state.tab]) render(state.tab);
+}
+let lastY = 0;                                            // the floating + Add button steps aside while the page scrolls down and returns on the way up
+window.addEventListener('scroll', () => {
+  if (!PHONE) return;
+  const y = window.scrollY || 0, d = y - lastY;
+  if (Math.abs(d) < 8) return;
+  document.body.classList.toggle('fab-hide', d > 0 && y > 80);
+  lastY = y;
+}, { passive: true });
+if (mq.addEventListener) mq.addEventListener('change', onPhoneChange); else if (mq.addListener) mq.addListener(onPhoneChange);
+// ------------------------------------------------------------------ THEME (Automatic follows the device; Light / Dark override it on this device only)
+const THEMES = ['auto', 'light', 'dark'], THEME_TXT = { auto: 'Automatic (follows your device)', light: 'Light', dark: 'Dark' };
+const THEME_ICON = {
+  auto: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor"/></svg>',
+  light: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5M5.3 5.3l1.8 1.8M16.9 16.9l1.8 1.8M5.3 18.7l1.8-1.8M16.9 7.1l1.8-1.8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+  dark: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>'
+};
+let themeNow = '';
+function getTheme() {
+  if (themeNow) return themeNow;
+  let v = ''; try { v = localStorage.getItem('theme') || ''; } catch (e) { v = ''; }
+  themeNow = THEMES.indexOf(v) >= 0 ? v : 'auto';
+  return themeNow;
+}
+function applyTheme(t) {
+  themeNow = t;
+  const el = document.documentElement;
+  if (t === 'auto') el.removeAttribute('data-theme'); else el.setAttribute('data-theme', t);
+  const b = $('#btnTheme'); if (!b) return;
+  const lbl = 'Theme: ' + THEME_TXT[t] + '. Click to change.';
+  b.innerHTML = THEME_ICON[t]; b.title = lbl; b.setAttribute('aria-label', lbl);
+}
+function cycleTheme() {
+  const t = THEMES[(THEMES.indexOf(getTheme()) + 1) % THEMES.length];
+  try { localStorage.setItem('theme', t); } catch (e) { /* storage may be blocked: the choice then lasts until the page is closed */ }
+  applyTheme(t); toast('Theme: ' + THEME_TXT[t]);
+}
+applyTheme(getTheme());
+$('#btnTheme').addEventListener('click', cycleTheme);
+$('#btnRefresh').addEventListener('click', refreshNow);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+const fillers = { owned: fillOwned, watch: fillWatch, sold: fillSold, log: fillLog };
+const fullRender = { owned: renderOwned, sold: renderSold };
+$$('main section').forEach(sec => {
+  const tab = sec.id.replace('tab-', '');
+  sec.addEventListener('input', e => {
+    const id = e.target.id;
+    if (tab === 'history' && (id === 'f-haccount' || id === 'f-hrange')) { if (id === 'f-haccount') ui.history.account = e.target.value; else ui.history.range = e.target.value; return renderHistory(); }
+    if (!fillers[tab]) return;
+    if (id === 'f-account' || id === 'f-year') { ui[tab][id === 'f-account' ? 'account' : 'year'] = e.target.value; return fullRender[tab](); }
+    if (id === 'f-q') ui[tab].q = e.target.value;
+    else if (id === 'f-market') ui[tab].market = e.target.value;
+    else if (id === 'f-status') ui[tab].status = e.target.value;
+    else if (id === 'f-sort') { ui[tab].sort = e.target.value; delete colSort[tab]; saveView(tab); }
+    else return;
+    fillers[tab]();
+    syncFilters(tab);
+  });
+  sec.addEventListener('click', async e => {
+    if (e.target.closest('.rz')) return;
+    const th = e.target.closest('th.sortable');
+    if (th && fillers[tab]) {
+      if (Date.now() - lastResize < 300) return;                // the click that ends a column drag is not a sort
+      const k = th.dataset.sort, c = colSort[tab];
+      colSort[tab] = { key: k, dir: c && c.key === k ? -c.dir : 1 };
+      saveView(tab);
+      return fillers[tab]();
+    }
+    const a = e.target.closest('[data-act]');
+    if (!a) return;
+    e.stopPropagation();
+    const t = a.dataset.t, ac = a.dataset.a, act = a.dataset.act;
+    if (act === 'reload') return loadTab(tab, true);
+    if (act === 'filters') { phoneUi.filters[tab] = !phoneUi.filters[tab]; $('.toolbar', sec).classList.toggle('fopen', phoneUi.filters[tab]); return; }
+    if (act === 'more') return openActions(tab);
+    if (act === 'add') return openAdd(tab);
+    if (act === 'sell') return openSell(t, ac);
+    if (act === 'links') return openLinkMenu(a);
+    if (act === 'note') return openNote(a.dataset.k, t, ac, a.dataset.s);
+    if (act === 'tkfilter') { Object.assign(ui.owned, { tk: t, account: '', market: '', q: '' }); return renderOwned(); }       // all positions of this ticker, whatever filters were set
+    if (act === 'tkclear') { ui.owned.tk = ''; return renderOwned(); }
+    if (act === 'cols') return openColumns(tab);
+    if (act === 'setCash') return openSetCash(ac);
+    if (act === 'adjCash') return openAdjustCash(ac);
+    if (act === 'cashLog') return openCashLog(ac);
+    if (act === 'edit') return openEdit(t, ac);
+    if (act === 'toggle') { const k = t + '\u241F' + ac; ui.owned.open[k] = !ui.owned.open[k]; return PHONE ? fillOwned() : renderOwned(); }
+    if (act === 'toggleAll') { const scope = ui.owned.account ? state.owned.rows.filter(r => r.account === ui.owned.account) : state.owned.rows, openAll = !(scope.length && scope.every(r => ui.owned.open[rowKey(r)])); scope.forEach(r => { ui.owned.open[rowKey(r)] = openAll; }); return renderOwned(); }
+    if (act === 'sellLot') return openSell(t, ac, a.dataset.l);
+    if (act === 'editLot') return openEditLot(t, ac, a.dataset.l);
+    if (act === 'delLot') {
+      const pr = state.owned.rows.find(x => x.ticker === t && x.account === ac), lastNote = pr && pr.lotCount === 1 && pr.note ? ' This is the only lot, so the position\'s note is deleted too.' : '';
+      if (await confirmModal('Delete this lot?', 'This removes one purchase of <b>' + esc(t) + '</b> (' + esc(ac) + ') without creating a Sold record. Use it for data-entry mistakes; to record a sale use Sell this lot.' + lastNote, 'Delete', true)) mutate(call('deleteLot', a.dataset.l));
+      return;
+    }
+    if (act === 'import') return openImport();
+    if (act === 'ioMenu') return $('.iomenu') ? closeLinkMenu() : openIoMenu(a);
+    if (act === 'export') return openExport(tab === 'sold' ? 'sold' : 'owned');
+    if (act === 'recordHistory') return mutate(call('recordHistoryNow'));
+    if (act === 'addAcc') return openAccountName('Add account', '', n => call('addAccount', n));
+    if (act === 'renameAcc') return openAccountName('Rename account', ac, n => call('renameAccount', ac, n));
+    if (act === 'delAcc') { if (await confirmModal('Delete account?', 'Delete the unused account <b>' + esc(ac) + '</b>?', 'Delete', true)) mutate(call('deleteAccount', ac)); return; }
+    if (act === 'wrow') return openWatchRow(t);
+    if (act === 'del') {
+      const pr = tab === 'owned' ? state.owned.rows.find(x => x.ticker === t && x.account === ac) : null;
+      const wr = tab === 'owned' ? null : state.watch.rows.find(x => x.ticker === t), hasNote = tab === 'owned' ? !!(pr && pr.note) : !!(wr && wr.note);
+      const label = (tab === 'owned' ? 'This removes the whole position (' + ac + (pr ? ', ' + pr.lotCount + ' lot' + (pr.lotCount === 1 ? '' : 's') : '') + ') without creating a Sold record. Use it for data-entry mistakes; to record a sale, click the row instead.' : 'Remove this row from the Watchlist?') + (hasNote ? ' Its note is deleted too.' : '');
+      if (await confirmModal('Delete ' + t + '?', esc(label), 'Delete', true)) mutate(tab === 'owned' ? call('deleteOwnedRow', t, ac) : call('deleteWatchlistRow', t));
+      return;
+    }
+    if (act === 'sw') return mutate(call('addSoldToWatchlist', t));
+    if (act === 'removePaused') { if (await confirmModal('Remove all Paused?', 'All Paused Watchlist rows will be deleted, with their notes.', 'Remove', true)) mutate(call('removeAllPaused')); return; }
+    if (act === 'saveSched') {
+      const hours = $$('.hr', sec).map(c => ({ hour: Number(c.dataset.h), run: c.checked }));
+      const r = await call('saveSchedule', { weekdaysOnly: $('#wk', sec).checked, hours });
+      if (r.success) { toast('Schedule saved'); state.schedule = r.data; loadInfo(); } else toast(r.message, 'error');
+      return;
+    }
+    if (act === 'clearLog') { if (await confirmModal('Clear Log?', 'All log rows will be deleted (the header stays).', 'Clear', true)) mutate(call('clearLog')); return; }
+    if (act === 'archive') {
+      const y = new Date().getMonth() === 0 ? new Date().getFullYear() - 1 : new Date().getFullYear();
+      openModal({
+        title: 'Archive year', body: '<p>Copies this whole spreadsheet to <b>Investment_YYYY</b>, then clears <b>Sold</b> and <b>Log</b> to start a fresh year. Owned and Watchlist are kept.</p><div class="field"><label>Year</label><input id="yr" type="number" value="' + y + '"></div>',
+        submit: 'Archive', onSubmit: async m => {
+          const r = await call('archiveYear', Number($('#yr', m).value));
+          if (r.success) { toast(r.message); invalidate(); return true; }
+          setErr(m, r.message); return false;
+        }
+      });
+    }
+  });
+});
+
+// ------------------------------------------------------------------ start
+(async () => {
+  await Promise.race([loadPrefs(), new Promise(r => setTimeout(r, 1500))]);      // saved column widths first, so the first draw already uses them
+  loadTab('owned', true); loadInfo(); loadSymbols();
+})();
+})();
+</script>
