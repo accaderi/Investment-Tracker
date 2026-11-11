@@ -1335,7 +1335,8 @@ async function loadInfo() {
   const r = await call('getRefreshInfo');
   if (!r.success) return;
   state.info = r.data;
-  $('#lastUpdated').textContent = 'Last updated: ' + (r.data.lastSuccessfulRefresh || 'never');
+  const lu = $('#lastUpdated'), lv = document.createElement('span');          // the date and time stay together: when the line must wrap, it wraps before the date
+  lu.textContent = 'Last updated: '; lv.className = 'nw'; lv.textContent = r.data.lastSuccessfulRefresh || 'never'; lu.appendChild(lv);
   $('#nextRuns').textContent = r.data.nextRuns.length ? '· next: ' + r.data.nextRuns.join(', ') : '· no hours enabled';
 }
 let cooldownTimer = null;

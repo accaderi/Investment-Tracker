@@ -7,6 +7,7 @@
 html,body{height:100%}
 body{margin:0;display:flex;flex-direction:column;overflow:hidden;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 .hdr{flex:0 0 auto;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+.nw{white-space:nowrap}
 .hdr-r{display:flex;align-items:center;gap:8px;flex:0 0 auto}.btn.icon{width:36px;height:36px;padding:0;display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto}.btn.icon{color:var(--text)}.btn.icon svg{width:19px;height:19px;display:block}
 .hdr h1{margin:0;font-size:20px}.hdr-meta{font-size:13px}.muted{color:var(--muted)}.small{font-size:12px}
 .tabs{flex:0 0 auto;display:flex;gap:2px;padding:0 20px;background:var(--panel);border-bottom:1px solid var(--line);overflow-x:auto}
@@ -110,7 +111,8 @@ html.phone .hdr-l{min-width:0;flex:1 1 auto}
 html.phone .hdr h1{font-size:17px;line-height:1.25}
 html.phone .hdr-meta{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 html.phone #nextRuns,html.phone .hdr-note{display:none}
-html.phone #btnRefresh{flex:0 0 auto;white-space:nowrap;min-height:40px}html.phone .hdr-r{gap:6px}html.phone #btnTheme{width:40px;height:40px}html.phone #btnTheme svg{width:22px;height:22px}@media (max-width:349px){html.phone #btnTheme{display:none}}
+html.phone #btnRefresh{flex:0 0 auto;white-space:nowrap;min-height:40px}html.phone .hdr-r{gap:6px}html.phone #btnTheme{width:40px;height:40px}html.phone #btnTheme svg{width:22px;height:22px}@media (max-width:399px){html.phone .hdr-meta{white-space:normal;overflow:visible}}   /* the date and time may wrap (together) instead of being cut off */
+@media (max-width:359px){html.phone .hdr{padding:8px 10px;gap:8px}html.phone .hdr h1{font-size:15px}html.phone .hdr-r{gap:4px}html.phone #btnRefresh{padding:6px 10px;font-size:13px}html.phone #btnTheme{width:36px}html.phone #btnTheme svg{width:20px;height:20px}}
 html.phone main{display:block;padding:10px 12px calc(var(--nav-h) + 96px + env(safe-area-inset-bottom))}
 html.phone .tab.active,html.phone .tab.scroll.active{display:block;overflow:visible}
 html.phone .tab.fill>.table-wrap{max-height:none}
